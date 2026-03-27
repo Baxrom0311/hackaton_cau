@@ -3,6 +3,7 @@ import streamlit as st
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 import cv2
 import timm
 import segmentation_models_pytorch as smp
@@ -11,7 +12,7 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 
 # ==============================================================================
-# AI Healthcare Hackathon 2026 — Presentation UI (V5 ULTRA)
+# AI Healthcare Hackathon 2026 — Presentation UI (PRO VERSION)
 # ==============================================================================
 # "The interface must clearly display the statement: 
 #  For research and demonstration purposes only. Not for clinical use."
@@ -163,135 +164,198 @@ def draw_overlay(image_np, mask_np):
     cv2.drawContours(overlay, contours, -1, (255, 255, 0), 2) # Yellow border
     return overlay
 
-# --- UI Setup & Premium CSS ---
-st.set_page_config(page_title="Biopsy AI Analysis", page_icon="🧬", layout="wide", initial_sidebar_state="collapsed")
+# --- MULTI-LANGUAGE DICTIONARY ---
+TRANSLATIONS = {
+    "🇺🇿 O'zbekcha": {
+        "title": "🩺 Tibbiy AI Diagnostika Tizimi",
+        "warn": "⚠️ Faqat tadqiqot va ko'rgazma maqsadlarida. Klinik foydalanish uchun taqiqlanadi.",
+        "settings": "⚙️ Tizim Sozlamalari",
+        "cls_model": "Klassifikatsiya Modeli Yo'li",
+        "seg_model": "Segmentatsiya Modeli Yo'li",
+        "tab1": "Kasallikni Aniqlash (Task A)",
+        "tab2": "To'qimani Segmentlash (Task B)",
+        "upload": "📥 Biopsiya rasmini yuklang (PNG/JPG)",
+        "original": "📸 Asl Rasm",
+        "results": "🤖 AI Tahlil Natijasi",
+        "running_cls": "🔬 chuqur tahlil qilinmoqda...",
+        "running_seg": "🔬 zararlangan hudud chizilmoqda...",
+        "pred_class": "Bashorat Qilingan Sinf:",
+        "conf": "Ishonchlilik Darajasi:",
+        "low_conf": "⚠️ Past Ishonchlilik: Kadrda artefaktlar bo'lishi yoki noma'lum sinf bo'lishi mumkin.",
+        "distribution": "📊 Ehtimolliklar Taqsimoti",
+        "lesion_area": "Kasallangan Maydon",
+        "tissue_prop": "Umumiy Kadrga Nisbatan",
+        "upload_req": "Tahlilni boshlash uchun fayl yuklang.",
+        "err_cls": "Klassifikatsiya modeli yuklanmadi.",
+        "err_seg": "Segmentatsiya modeli yuklanmadi."
+    },
+    "🇬🇧 English": {
+        "title": "🩺 AI Medical Diagnostic System",
+        "warn": "⚠️ For research and demonstration purposes only. Not for clinical use.",
+        "settings": "⚙️ System Configuration",
+        "cls_model": "Classification Model Path",
+        "seg_model": "Segmentation Model Path",
+        "tab1": "Disease Classification (Task A)",
+        "tab2": "Tissue Segmentation (Task B)",
+        "upload": "📥 Upload Biopsy Image (PNG/JPG)",
+        "original": "📸 Original Image",
+        "results": "🤖 AI Analysis Insights",
+        "running_cls": "🔬 Running Deep Classification...",
+        "running_seg": "🔬 Mapping Region of Interest...",
+        "pred_class": "Predicted Disease Class:",
+        "conf": "Confidence Score:",
+        "low_conf": "⚠️ Low Confidence: Artifact detected or Out-of-Distribution sample.",
+        "distribution": "📊 Probability Distribution",
+        "lesion_area": "Lesion Pixel Area",
+        "tissue_prop": "Tissue Proportion",
+        "upload_req": "Please upload an image to begin the analysis.",
+        "err_cls": "Classification module offline.",
+        "err_seg": "Segmentation module offline."
+    },
+    "🇷🇺 Русский": {
+        "title": "🩺 ИИ Система Медицинской Диагностики",
+        "warn": "⚠️ Только для исследований и демонстрации. Не для клинического использования.",
+        "settings": "⚙️ Настройки Системы",
+        "cls_model": "Путь к модели классификации",
+        "seg_model": "Путь к модели сегментации",
+        "tab1": "Классификация Заболеваний (Task A)",
+        "tab2": "Сегментация Тканей (Task B)",
+        "upload": "📥 Загрузите снимок биопсии (PNG/JPG)",
+        "original": "📸 Исходный снимок",
+        "results": "🤖 Результаты ИИ-анализа",
+        "running_cls": "🔬 Выполнение глубокой классификации...",
+        "running_seg": "🔬 Картографирование зараженной области...",
+        "pred_class": "Прогнозируемый Класс:",
+        "conf": "Уровень Уверенности:",
+        "low_conf": "⚠️ Низкая уверенность: обнаружен артефакт или неизвестный класс.",
+        "distribution": "📊 Распределение Вероятностей",
+        "lesion_area": "Площадь Поражения",
+        "tissue_prop": "Доля от общего кадра",
+        "upload_req": "Пожалуйста, загрузите изображение для начала.",
+        "err_cls": "Модуль классификации отключен.",
+        "err_seg": "Модуль сегментации отключен."
+    }
+}
 
-# Inject Custom Premium CSS (Glassmorphism, Animations, Modern Fonts)
+# --- UI Setup & Premium CSS ---
+st.set_page_config(page_title="AI Medical Diagnostics", page_icon="🩺", layout="wide", initial_sidebar_state="expanded")
+
+# Inject Clean, Clinical CSS Theme
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap');
     
     html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
+        font-family: 'Roboto', sans-serif;
     }
     
-    /* Main Background Gradient */
+    /* Clinical Minimalist Theme */
     .stApp {
-        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
-        color: #f8fafc;
+        background-color: #f8fafc;
+        color: #0f172a;
     }
     
-    /* Glassmorphic Container */
-    .glass-container {
-        background: rgba(255, 255, 255, 0.03);
-        backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px);
-        border-radius: 20px;
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        padding: 30px;
-        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.3);
+    /* Clean Cards */
+    .clinical-card {
+        background: #ffffff;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+        padding: 25px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
         margin-bottom: 20px;
-        animation: fadeIn 0.8s ease-out;
     }
     
-    /* Typography & Glow */
-    .title-glow {
-        font-size: 3rem;
-        font-weight: 800;
-        background: -webkit-linear-gradient(45deg, #38bdf8, #818cf8, #c084fc);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
+    /* Header Styling */
+    .main-title {
+        color: #0f172a;
+        font-weight: 700;
+        font-size: 2.5rem;
         text-align: center;
-        margin-bottom: 5px;
-        text-shadow: 0px 0px 20px rgba(129, 140, 248, 0.4);
-    }
-    .subtitle {
-        text-align: center;
-        color: #94a3b8;
-        font-size: 1.1rem;
-        margin-bottom: 30px;
-        font-weight: 300;
+        margin-bottom: 0.5rem;
     }
     
     /* Disclaimer Banner */
     .disclaimer {
-        background: rgba(239, 68, 68, 0.1);
+        background-color: #fef2f2;
         border-left: 4px solid #ef4444;
-        color: #fca5a5;
+        color: #991b1b;
         padding: 12px 20px;
-        border-radius: 8px;
-        font-size: 0.9rem;
-        font-weight: 600;
+        border-radius: 6px;
+        font-size: 0.95rem;
+        font-weight: 500;
         text-align: center;
-        margin-bottom: 30px;
-    }
-    
-    /* Image Wrappers */
-    .img-wrapper {
-        border-radius: 12px;
-        overflow: hidden;
-        border: 2px solid rgba(255,255,255,0.05);
-        box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-        transition: transform 0.3s ease;
-    }
-    .img-wrapper:hover {
-        transform: scale(1.02);
-        border-color: rgba(56, 189, 248, 0.5);
+        margin-bottom: 25px;
     }
     
     /* Metric Cards */
-    .metric-card {
-        background: rgba(15, 23, 42, 0.6);
-        border: 1px solid rgba(56, 189, 248, 0.2);
-        border-radius: 12px;
-        padding: 20px;
+    .metric-box {
+        background: #f1f5f9;
+        border-radius: 8px;
+        padding: 15px;
         text-align: center;
-        margin-top: 15px;
+        border-top: 4px solid #3b82f6;
     }
     .metric-value {
-        font-size: 2.5rem;
-        font-weight: 800;
-        color: #38bdf8;
+        font-size: 2rem;
+        font-weight: 700;
+        color: #1e293b;
     }
     .metric-label {
-        font-size: 0.9rem;
-        color: #cbd5e1;
+        font-size: 0.85rem;
+        color: #64748b;
         text-transform: uppercase;
-        letter-spacing: 1px;
+        font-weight: 500;
     }
     
-    /* Custom Animations */
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(20px); }
-        to { opacity: 1; transform: translateY(0); }
+    /* Custom Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 20px;
+        background-color: #ffffff;
+        padding: 10px 20px 0px 20px;
+        border-radius: 12px 12px 0 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.02);
     }
-    
-    /* Hide Streamlit components */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
+    .stTabs [data-baseweb="tab"] {
+        height: 50px;
+        white-space: pre-wrap;
+        background-color: transparent;
+        border-radius: 4px 4px 0px 0px;
+        gap: 1px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        color: #64748b;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        color: #2563eb !important;
+        border-bottom: 3px solid #2563eb !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ─── App Header ───
-st.markdown('<div class="disclaimer">⚠️ For research and demonstration purposes only. Not for clinical use.</div>', unsafe_allow_html=True)
-st.markdown('<div class="title-glow">🔬 AI Biopsy Diagnostic System</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Next-Generation Classification & Segmentation powered by Deep Learning</div>', unsafe_allow_html=True)
-
-# ─── Sidebar Settings (Hidden by default for clean UI) ───
+# ─── Sidebar Settings & Languages ───
 with st.sidebar:
-    st.header("⚙️ System Configuration")
-    cls_model_path = st.text_input("Classification Model Path", "models/classification/best_model.pth")
-    seg_model_path = st.text_input("Segmentation Model Path", "models/segmentation/best_model.pth")
+    selected_lang = st.selectbox("🌐 Language / Til / Язык", list(TRANSLATIONS.keys()))
+    t = TRANSLATIONS[selected_lang]
+    
+    st.markdown("---")
+    st.header(t["settings"])
+    cls_model_path = st.text_input(t["cls_model"], "models/classification/best_model.pth")
+    seg_model_path = st.text_input(t["seg_model"], "models/segmentation/best_model.pth")
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     st.info(f"Compute Engine: **{device.upper()}**")
 
 # Load Models
 cls_model, cls_ckpt, seg_model, seg_ckpt = load_models(cls_model_path, seg_model_path, device)
 
+# ─── App Header ───
+st.markdown(f'<div class="disclaimer">{t["warn"]}</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="main-title">{t["title"]}</div>', unsafe_allow_html=True)
+st.markdown("<br>", unsafe_allow_html=True)
+
 # ─── Main Interface ───
-st.markdown('<div class="glass-container">', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("📥 Upload Biopsy Image (PNG/JPG)", type=["png", "jpg", "jpeg"])
+st.markdown('<div class="clinical-card">', unsafe_allow_html=True)
+uploaded_file = st.file_uploader(t["upload"], type=["png", "jpg", "jpeg"])
 st.markdown('</div>', unsafe_allow_html=True)
 
 if uploaded_file is not None:
@@ -299,82 +363,99 @@ if uploaded_file is not None:
     image = Image.open(uploaded_file).convert("RGB")
     image_np = np.array(image)
     
-    st.markdown('<div class="glass-container">', unsafe_allow_html=True)
+    # ─── TABS LAYOUT ───
+    tab1, tab2 = st.tabs([t["tab1"], t["tab2"]])
     
-    col1, col2 = st.columns([1, 1], gap="large")
-    
-    with col1:
-        st.markdown("### 📸 Original Biopsy Image")
-        st.image(image, use_column_width=True, clamp=True)
+    # ==========================================
+    # TAB 1: CLASSIFICATION (Task A)
+    # ==========================================
+    with tab1:
+        st.markdown('<div class="clinical-card">', unsafe_allow_html=True)
+        colA1, colA2 = st.columns([1, 1], gap="large")
         
-    with col2:
-        st.markdown("### 🤖 Clinical AI Insights")
+        with colA1:
+            st.markdown(f"### {t['original']}")
+            st.image(image, use_container_width=True, clamp=True)
+            
+        with colA2:
+            st.markdown(f"### {t['results']}")
+            if cls_model is not None:
+                with st.spinner(t["running_cls"]):
+                    cls_size = cls_ckpt.get("img_size", 224)
+                    pred_class, probs = run_classification(cls_model, image_np, cls_size, device)
+                    confidence = float(probs[pred_class])
+                    
+                    # Highlight color based on confidence
+                    color = "#22c55e" if confidence > 0.8 else ("#eab308" if confidence > 0.5 else "#ef4444")
+                    
+                    st.markdown(f"""
+                    <div class="metric-box" style="border-top-color: {color};">
+                        <div class="metric-label">{t['pred_class']}</div>
+                        <div class="metric-value">Class {pred_class}</div>
+                        <div class="metric-label" style="text-transform: none; margin-top: 8px; font-size: 1rem; color: #475569;">
+                            {t['conf']} <strong style="color: {color};">{(confidence * 100):.1f}%</strong>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    if confidence < 0.40:
+                        st.warning(t["low_conf"])
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    with st.expander(t["distribution"]):
+                        prob_df = pd.DataFrame({"Probability": probs})
+                        st.bar_chart(prob_df)
+            else:
+                st.error(t["err_cls"])
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ==========================================
+    # TAB 2: SEGMENTATION (Task B)
+    # ==========================================
+    with tab2:
+        st.markdown('<div class="clinical-card">', unsafe_allow_html=True)
+        colB1, colB2 = st.columns([1, 1], gap="large")
         
-        # 1. Classification
-        if cls_model is not None:
-            with st.spinner("🔬 Running Deep Classification..."):
-                cls_size = cls_ckpt.get("img_size", 224)
-                pred_class, probs = run_classification(cls_model, image_np, cls_size, device)
-                confidence = float(probs[pred_class])
-                
-                # Dynamic Metric Card
-                color = "#22c55e" if confidence > 0.8 else ("#eab308" if confidence > 0.5 else "#ef4444")
-                st.markdown(f"""
-                <div class="metric-card" style="border-left: 4px solid {color};">
-                    <div class="metric-label">Predicted Disease Class</div>
-                    <div class="metric-value">Class {pred_class}</div>
-                    <div class="metric-label" style="text-transform: none; margin-top: 5px; color: {color};">
-                        Confidence: {(confidence * 100):.1f}%
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                if confidence < 0.40:
-                    st.warning("⚠️ **Low Confidence**: Artifact detected or Out-of-Distribution sample.")
-                
-                with st.expander("📊 View Probability Distribution"):
-                    prob_df = pd.DataFrame({"Probability": probs})
-                    st.bar_chart(prob_df)
-        else:
-            st.error("Classification module offline.")
+        with colB1:
+            st.markdown(f"### {t['original']}")
+            st.image(image, use_container_width=True, clamp=True)
             
-        # 2. Segmentation
-        if seg_model is not None:
-            st.markdown("---")
-            with st.spinner("🔬 Mapping Region of Interest (ROI)..."):
-                seg_size = seg_ckpt.get("img_size", 224)
-                mask = run_segmentation(seg_model, image_np, seg_size, device)
-                overlay_img = draw_overlay(image_np, mask)
-                
-                st.markdown("### 🎯 AI Segmentation Map")
-                st.image(overlay_img, use_column_width=True)
-                
-                # Stats
-                pixel_count = int(np.sum(mask))
-                total_pixels = mask.size
-                percentage = (pixel_count / total_pixels) * 100
-                
-                st.markdown(f"""
-                <div style="display: flex; gap: 15px; margin-top: 15px;">
-                    <div class="metric-card" style="flex: 1; padding: 10px;">
-                        <div class="metric-label">Lesion Pixel Area</div>
-                        <div style="font-size: 1.5rem; color: #a855f7; font-weight: bold;">{pixel_count:,} px</div>
+        with colB2:
+            st.markdown(f"### {t['results']}")
+            if seg_model is not None:
+                with st.spinner(t["running_seg"]):
+                    seg_size = seg_ckpt.get("img_size", 224)
+                    mask = run_segmentation(seg_model, image_np, seg_size, device)
+                    overlay_img = draw_overlay(image_np, mask)
+                    
+                    st.image(overlay_img, use_container_width=True)
+                    
+                    # Stats calculation
+                    pixel_count = int(np.sum(mask))
+                    total_pixels = mask.size
+                    percentage = (pixel_count / total_pixels) * 100
+                    
+                    st.markdown(f"""
+                    <div style="display: flex; gap: 15px; margin-top: 15px;">
+                        <div class="metric-box" style="flex: 1; border-top-color: #8b5cf6;">
+                            <div class="metric-label">{t['lesion_area']}</div>
+                            <div class="metric-value" style="font-size: 1.5rem; color: #7c3aed;">{pixel_count:,} px</div>
+                        </div>
+                        <div class="metric-box" style="flex: 1; border-top-color: #ec4899;">
+                            <div class="metric-label">{t['tissue_prop']}</div>
+                            <div class="metric-value" style="font-size: 1.5rem; color: #db2777;">{percentage:.2f}%</div>
+                        </div>
                     </div>
-                    <div class="metric-card" style="flex: 1; padding: 10px;">
-                        <div class="metric-label">Tissue Proportion</div>
-                        <div style="font-size: 1.5rem; color: #ec4899; font-weight: bold;">{percentage:.2f}%</div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.error("Segmentation module offline.")
-            
-    st.markdown('</div>', unsafe_allow_html=True) # End glass container
+                    """, unsafe_allow_html=True)
+            else:
+                st.error(t["err_seg"])
+        st.markdown('</div>', unsafe_allow_html=True)
+
 else:
-    st.markdown("""
-    <div style="text-align: center; padding: 50px; color: #64748b;">
-        <h2 style="font-weight: 300;">Ready for Analysis</h2>
-        <p>Upload a biopsy image above to trigger the AI pipeline.</p>
+    st.markdown(f"""
+    <div style="text-align: center; padding: 60px; color: #94a3b8; background: #ffffff; border-radius: 12px; border: 1px dashed #cbd5e1;">
+        <h2 style="font-weight: 300; margin-bottom: 10px;">{t['title']}</h2>
+        <p>{t['upload_req']}</p>
     </div>
     """, unsafe_allow_html=True)
 
