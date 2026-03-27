@@ -12,30 +12,55 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import timm
+import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from tqdm import tqdm
 
+# ─── Preprocessing ──────────────────────────────────────────────────────────
+def robust_resize(img, sz):
+    """Aspect-ratio preserving padding (Matches V5 Training)"""
+    h, w = img.shape[:2]
+    scale = sz / max(h, w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    pad_h = (sz - new_h) // 2
+    pad_w = (sz - new_w) // 2
+    img = cv2.copyMakeBorder(img, pad_h, sz - new_h - pad_h, pad_w, sz - new_w - pad_w, 
+                            cv2.BORDER_CONSTANT, value=0)
+    return img
+
 # ─── TTA ────────────────────────────────────────────────────────────────────
-def get_tta_transforms(img_size):
-    base = [
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ]
+def get_tta_transforms():
+    """Returns basic augmentations for TTA (Resize is handled by robust_resize)"""
     return [
-        A.Compose(base),
-        A.Compose([A.HorizontalFlip(p=1.0)] + base),
-        A.Compose([A.VerticalFlip(p=1.0)] + base),
-        A.Compose([A.RandomRotate90(p=1.0)] + base),
+        None, # Original
+        A.HorizontalFlip(p=1.0),
+        A.VerticalFlip(p=1.0),
+        A.RandomRotate90(p=1.0)
     ]
 
 @torch.no_grad()
-def predict_tta(model, img_np, tta_tfms, device):
+def predict_tta(model, img_np, img_size, device):
     all_probs = []
-    for tfm in tta_tfms:
-        tensor = tfm(image=img_np)["image"].unsqueeze(0).to(device)
+    
+    # Base normalization/tensorization
+    base_tfm = A.Compose([
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+
+    # 1. Resize once using robust logic
+    img_resized = robust_resize(img_np, img_size)
+    
+    # 2. Apply TTA
+    tta_ops = get_tta_transforms()
+    for op in tta_ops:
+        aug_img = op(image=img_resized)["image"] if op else img_resized
+        tensor = base_tfm(image=aug_img)["image"].unsqueeze(0).to(device)
+        
         with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
             logits = model(tensor)
         probs = F.softmax(logits, dim=1)
@@ -49,7 +74,7 @@ def main():
     parser = argparse.ArgumentParser(description="Classification Inference Script")
     parser.add_argument("--test_dir", type=str, required=True, help="Directory containing test images")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained PyTorch model (.pth)")
-    parser.add_argument("--team", type=str, default="TeamName", help="Your team name for the output Excel file")
+    parser.add_argument("--team", type=str, default="Baxrom", help="Your team name for the output Excel file")
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -70,15 +95,19 @@ def main():
     model.to(device).eval()
     print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, Acc: {ckpt.get('val_acc', '?'):.4f})")
 
-    tta_tfms = get_tta_transforms(ckpt.get("img_size", 512))
+    img_size = ckpt.get("img_size", 224)
     files = sorted([f for f in os.listdir(args.test_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
-    print(f"📸 Test images found: {len(files)}")
+    print(f"📸 Test images found: {len(files)} | Preprocessing: Robust Padding ({img_size}x{img_size})")
 
     all_ids, all_preds = [], []
     for f in tqdm(files, desc="Predicting"):
         path = os.path.join(args.test_dir, f)
-        img = np.array(Image.open(path).convert("RGB"))
-        pred = predict_tta(model, img, tta_tfms, device)
+        try:
+            img = np.array(Image.open(path).convert("RGB"))
+            pred = predict_tta(model, img, img_size, device)
+        except Exception as e:
+            print(f"\n⚠️ Error processing {f}: {e}")
+            pred = -1  # Invalid/Error class
 
         all_ids.append(os.path.splitext(f)[0])
         all_preds.append(pred)

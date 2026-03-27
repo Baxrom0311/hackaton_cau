@@ -11,14 +11,25 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 
 # ==============================================================================
-# AI Healthcare Hackathon 2026 — Presentation UI
+# AI Healthcare Hackathon 2026 — Presentation UI (V5 ULTRA)
 # ==============================================================================
-# Guidelines Rule 11 & 12 Implementation
 # "The interface must clearly display the statement: 
 #  For research and demonstration purposes only. Not for clinical use."
 # ==============================================================================
 
 # --- Helper Functions ---
+def robust_resize(img, sz):
+    """Aspect-ratio preserving padding (Matches V5 Training)"""
+    h, w = img.shape[:2]
+    scale = sz / max(h, w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    pad_h = (sz - new_h) // 2
+    pad_w = (sz - new_w) // 2
+    img = cv2.copyMakeBorder(img, pad_h, sz - new_h - pad_h, pad_w, sz - new_w - pad_w, 
+                            cv2.BORDER_CONSTANT, value=0)
+    return img
 @st.cache_resource
 def load_models(cls_path, seg_path, device):
     """Loads classification and segmentation models safely"""
@@ -66,8 +77,12 @@ def get_base_transforms(img_size):
 
 @torch.no_grad()
 def run_classification(model, img_np, img_size, device):
-    tfm = get_base_transforms(img_size)
-    tensor = tfm(image=img_np)["image"].unsqueeze(0).to(device)
+    img_resized = robust_resize(img_np, img_size)
+    normalize = A.Compose([
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+    tensor = normalize(image=img_resized)["image"].unsqueeze(0).to(device)
     with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
         logits = model(tensor)
     probs = F.softmax(logits, dim=1).squeeze().cpu().numpy()
@@ -77,13 +92,23 @@ def run_classification(model, img_np, img_size, device):
 @torch.no_grad()
 def run_segmentation(model, img_np, img_size, device):
     h_orig, w_orig = img_np.shape[:2]
-    tfm = get_base_transforms(img_size)
-    tensor = tfm(image=img_np)["image"].unsqueeze(0).to(device)
+    img_resized = robust_resize(img_np, img_size)
+    
+    normalize = A.Compose([
+        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ToTensorV2(),
+    ])
+    tensor = normalize(image=img_resized)["image"].unsqueeze(0).to(device)
     with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
         logits = model(tensor)
     prob_mask = torch.sigmoid(logits.float()).squeeze().cpu().numpy()
     
     binary_mask = (prob_mask > 0.5).astype(np.uint8)
+    
+    # 1. Resize binary mask back to padded size pixels
+    # 2. Then crop out the padding (or just resize back to original)
+    # The training logic used padding, so the model expects padded input.
+    # To get back to original, we just resize INTER_NEAREST back to orig.
     binary_mask = cv2.resize(binary_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
     
     # Morphology
@@ -145,9 +170,22 @@ if uploaded_file is not None:
             with st.spinner("Running Classification..."):
                 cls_size = cls_ckpt.get("img_size", 512)
                 pred_class, probs = run_classification(cls_model, image_np, cls_size, device)
-                st.success(f"**Predicted Disease Class:** {pred_class}")
-                # Optional: Show confidence bar
-                st.progress(float(probs[pred_class]), text=f"Confidence: {probs[pred_class]*100:.1f}%")
+                confidence = float(probs[pred_class])
+                
+                if confidence < 0.40:
+                    st.warning("⚠️ **Low Confidence (OOD)**: This image might not be a standard biopsy or belongs to an unknown class.")
+                else:
+                    st.success(f"**Predicted Disease Class:** Class {pred_class}")
+                    
+                st.progress(confidence, text=f"Confidence Score: {confidence*100:.1f}%")
+                
+                # Confidence Breakdown
+                import pandas as pd
+                prob_df = pd.DataFrame({
+                    "Class": [f"Class {i}" for i in range(len(probs))],
+                    "Probability": probs
+                })
+                st.bar_chart(prob_df.set_index("Class"))
         else:
             st.error("Classification model not loaded.")
             

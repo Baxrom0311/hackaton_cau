@@ -1,2 +1,23 @@
-*.png
+# Models & Large Binaries
 *.pth
+*.h5
+*.weights
+models/**/*.pth
+
+# Datasets
+dataset/
+Segmentation/
+classification/
+**/dataset/**
+**/Segmentation/**
+**/classification/**
+
+# Media & Logs
+*.png
+*.jpg
+*.jpeg
+*.xlsx
+logs/
+__pycache__/
+.DS_Store
+.venv/

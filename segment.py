@@ -16,7 +16,20 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from tqdm import tqdm
 
-# ─── Post-proc & TTA ────────────────────────────────────────────────────────
+# ─── Preprocessing ──────────────────────────────────────────────────────────
+def robust_resize(img, sz):
+    """Aspect-ratio preserving padding (Matches V5 Training)"""
+    h, w = img.shape[:2]
+    scale = sz / max(h, w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    
+    pad_h = (sz - new_h) // 2
+    pad_w = (sz - new_w) // 2
+    img = cv2.copyMakeBorder(img, pad_h, sz - new_h - pad_h, pad_w, sz - new_w - pad_w, 
+                            cv2.BORDER_CONSTANT, value=0)
+    return img
+
 def postprocess_mask(mask_binary):
     mask = mask_binary.astype(np.uint8)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -30,26 +43,32 @@ def postprocess_mask(mask_binary):
 @torch.no_grad()
 def predict_mask_tta(model, img_np, img_size, device):
     h_orig, w_orig = img_np.shape[:2]
-    normalize = A.Compose([
-        A.Resize(img_size, img_size),
+    
+    # 1. Resize once using robust logic
+    img_resized = robust_resize(img_np, img_size)
+    
+    base_tfm = A.Compose([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
 
     def predict_single(image):
-        t = normalize(image=image)["image"].unsqueeze(0).to(device)
+        t = base_tfm(image=image)["image"].unsqueeze(0).to(device)
         with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
             logits = model(t)
         return torch.sigmoid(logits.float()).squeeze(0).squeeze(0).cpu().numpy()
 
     preds = []
-    preds.append(predict_single(img_np))
-    preds.append(np.fliplr(predict_single(np.fliplr(img_np).copy())))
-    preds.append(np.flipud(predict_single(np.flipud(img_np).copy())))
-    preds.append(np.rot90(predict_single(np.rot90(img_np, 1).copy()), -1))
+    # TTA: Original, Horz, Vert, Rot90
+    preds.append(predict_single(img_resized))
+    preds.append(np.fliplr(predict_single(np.fliplr(img_resized).copy())))
+    preds.append(np.flipud(predict_single(np.flipud(img_resized).copy())))
+    preds.append(np.rot90(predict_single(np.rot90(img_resized, 1).copy()), -1))
 
     avg_pred = np.mean(preds, axis=0)
     binary_mask = (avg_pred > 0.5).astype(np.uint8)
+    
+    # Resize back to original (CRITICAL: Guide requirement)
     binary_mask = cv2.resize(binary_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
     binary_mask = postprocess_mask(binary_mask)
     return binary_mask * 255
@@ -59,7 +78,7 @@ def main():
     parser = argparse.ArgumentParser(description="Segmentation Inference Script")
     parser.add_argument("--test_dir", type=str, required=True, help="Directory containing test images")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the trained PyTorch model (.pth)")
-    parser.add_argument("--team", type=str, default="TeamName", help="Your team name for the output folder")
+    parser.add_argument("--team", type=str, default="Baxrom", help="Your team name for the output folder")
     args = parser.parse_args()
 
     if not os.path.exists(args.model_path):
@@ -85,16 +104,20 @@ def main():
     print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, IoU: {ckpt.get('val_iou', '?'):.4f})")
 
     os.makedirs(output_dir, exist_ok=True)
+    img_size = ckpt.get("img_size", 224)
     files = sorted([f for f in os.listdir(args.test_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
-    print(f"📸 Test images found: {len(files)}")
+    print(f"📸 Test images found: {len(files)} | Preprocessing: Robust Padding ({img_size}x{img_size})")
 
     for f in tqdm(files, desc="Predicting masks"):
         path = os.path.join(args.test_dir, f)
-        img = np.array(Image.open(path).convert("RGB"))
-        mask = predict_mask_tta(model, img, ckpt.get("img_size", 512), device)
-
-        out_name = os.path.splitext(f)[0] + ".png"
-        Image.fromarray(mask).save(os.path.join(output_dir, out_name))
+        try:
+            img = np.array(Image.open(path).convert("RGB"))
+            mask = predict_mask_tta(model, img, ckpt.get("img_size", 512), device)
+    
+            out_name = os.path.splitext(f)[0] + ".png"
+            Image.fromarray(mask).save(os.path.join(output_dir, out_name))
+        except Exception as e:
+            print(f"\n⚠️ Error processing {f}: {e}")
 
     print(f"\n✅ Submission tayyor: {output_dir}/ papkasida ({len(files)} ta fayl)")
 
