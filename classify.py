@@ -117,6 +117,8 @@ def main():
         all_preds.append(pred)
 
     df = pd.DataFrame({"Image_ID": all_ids, "Label": all_preds})
+    # Convert to integer for proper numerical sorting
+    df["Image_ID"] = pd.to_numeric(df["Image_ID"], errors="coerce")
     df = df.sort_values("Image_ID").reset_index(drop=True)
     df.to_excel(output_file, index=False)
     print(f"\n✅ Submission tayyor: {output_file} ({len(df)} ta bashorat)")

@@ -46,7 +46,7 @@ def main():
     validate_excel(args.excel_path)
     validate_masks_dir(args.masks_dir)
 
-    team_root = args.team
+    team_root = f"{args.team}_Submission"
     if os.path.exists(team_root):
         shutil.rmtree(team_root)
     os.makedirs(team_root)
@@ -54,8 +54,12 @@ def main():
     # 1. Excel File
     shutil.copy(args.excel_path, os.path.join(team_root, f"{args.team} test_ground_truth.xlsx"))
 
-    # 2. Masks Folder
-    shutil.copytree(args.masks_dir, os.path.join(team_root, args.team))
+    # 2. Masks Folder (Copying inside the submission folder)
+    dest_masks_dir = os.path.join(team_root, args.team)
+    if os.path.abspath(args.masks_dir) != os.path.abspath(dest_masks_dir):
+        shutil.copytree(args.masks_dir, dest_masks_dir)
+    else:
+        print("Warning: Input masks_dir and output team directory are the same. Check implementation.")
 
     # 3. Models & Scripts Folder
     models_dir = os.path.join(team_root, "models")
