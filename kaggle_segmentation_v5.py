@@ -23,13 +23,32 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import segmentation_models_pytorch as smp
 
+def resolve_existing_dir(candidates, description):
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    checked = "\n".join(f"  - {candidate}" for candidate in candidates)
+    raise FileNotFoundError(f"{description} not found. Checked:\n{checked}")
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 class CFG:
     BASE = "/kaggle/input/datasets/baxrom0311/main-dataset/Main hackathon dataset"
-    TRAIN_IMG_DIR = f"{BASE}/Segmentation/training/images"
-    TRAIN_MASK_DIR = f"{BASE}/Segmentation/training/masks"
-    VAL_IMG_DIR = TRAIN_IMG_DIR       # (90/10 split in dataset)
-    VAL_MASK_DIR = TRAIN_MASK_DIR
+    TRAIN_IMG_CANDIDATES = [
+        f"{BASE}/Segmentation/training/images",
+        f"{BASE}/segmentation/training/images",
+    ]
+    TRAIN_MASK_CANDIDATES = [
+        f"{BASE}/Segmentation/training/masks",
+        f"{BASE}/segmentation/training/masks",
+    ]
+    VAL_IMG_CANDIDATES = [
+        f"{BASE}/Segmentation/validation/images",
+        f"{BASE}/segmentation/validation/images",
+    ]
+    VAL_MASK_CANDIDATES = [
+        f"{BASE}/Segmentation/validation/masks",
+        f"{BASE}/segmentation/validation/masks",
+    ]
     MODEL_SAVE_DIR = "segmentation_v5"
 
     ENCODER = "efficientnet-b2"
@@ -48,6 +67,7 @@ class CFG:
     GRAD_CLIP = 5.0
     LOVASZ_WEIGHT = 0.5
     DICE_WEIGHT = 0.5
+    EARLY_STOP_PATIENCE = 7
 
 def robust_resize(img, sz, is_mask=False):
     """Aspect-ratio preserving padding (Ultra Quality)"""
@@ -170,6 +190,12 @@ def get_train_transforms(sz):
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
         A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.5),
+        A.OneOf([
+            A.CLAHE(clip_limit=4.0, p=1.0),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, p=1.0),
+        ], p=0.3),
+        A.ElasticTransform(alpha=50, sigma=5, p=0.15),
+        A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(8, 16), hole_width_range=(8, 16), p=0.15), # Removed fill_value
         ToTensorV2(),
     ])
 
@@ -188,16 +214,7 @@ class GPUSegPreprocessor:
     def __call__(self, imgs, masks, is_train=True):
         imgs = imgs.to(self.device, non_blocking=True).float() / 255.0
         masks = masks.to(self.device, non_blocking=True).float()
-        
-        if is_train:
-            # Synchronized Flips on GPU
-            if random.random() > 0.5:
-                imgs = torch.flip(imgs, dims=[3])
-                masks = torch.flip(masks, dims=[3])
-            if random.random() > 0.5:
-                imgs = torch.flip(imgs, dims=[2])
-                masks = torch.flip(masks, dims=[2])
-        
+        # Augmentation is handled by Albumentations only (no double-flip!)
         # Normalize Image on GPU
         imgs = (imgs - self.mean) / self.std
         return imgs, masks
@@ -214,12 +231,14 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, devi
     model.train()
     running_loss, running_iou, n = 0.0, 0.0, 0
     optimizer.zero_grad(set_to_none=True)
+    amp_enabled = str(device).startswith("cuda")
+    amp_device = "cuda" if amp_enabled else "cpu"
     pbar = tqdm(loader, desc="  Train", leave=False)
     
     for i, (images, masks) in enumerate(pbar):
         images, masks = preprocessor(images, masks, is_train=True)
         optimizer.zero_grad()
-        with torch.amp.autocast('cuda'):
+        with torch.amp.autocast(amp_device, enabled=amp_enabled):
             outputs = model(images)
             loss = criterion(outputs, masks)
 
@@ -245,16 +264,55 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, devi
 def validate(model, loader, criterion, device, preprocessor):
     model.eval()
     running_loss, running_iou, n = 0.0, 0.0, 0
+    amp_enabled = str(device).startswith("cuda")
+    amp_device = "cuda" if amp_enabled else "cpu"
     for images, masks in tqdm(loader, desc="  Valid", leave=False):
         images, masks = preprocessor(images, masks, is_train=False)
-        with torch.amp.autocast('cuda'):
-            outputs = model(images)
+        with torch.amp.autocast(amp_device, enabled=amp_enabled):
+            # TTA: Original + Horizontal + Vertical Flips
+            out1 = model(images)
+            out2 = torch.flip(model(torch.flip(images, dims=[3])), dims=[3])
+            out3 = torch.flip(model(torch.flip(images, dims=[2])), dims=[2])
+            outputs = (out1 + out2 + out3) / 3.0
             loss = criterion(outputs, masks)
         bs = images.size(0)
         running_loss += loss.item() * bs
         running_iou += compute_iou(outputs.float(), masks) * bs
         n += bs
     return running_loss / n, running_iou / n
+
+@torch.no_grad()
+def find_best_threshold(model, loader, device, preprocessor):
+    """Sweep thresholds 0.3-0.7 to find optimal IoU threshold."""
+    model.eval()
+    amp_enabled = str(device).startswith("cuda")
+    amp_device = "cuda" if amp_enabled else "cpu"
+    all_preds, all_masks = [], []
+    for images, masks in tqdm(loader, desc="  Threshold search", leave=False):
+        images, masks = preprocessor(images, masks, is_train=False)
+        with torch.amp.autocast(amp_device, enabled=amp_enabled):
+            out1 = model(images)
+            out2 = torch.flip(model(torch.flip(images, dims=[3])), dims=[3])
+            out3 = torch.flip(model(torch.flip(images, dims=[2])), dims=[2])
+            outputs = (out1 + out2 + out3) / 3.0
+        all_preds.append(torch.sigmoid(outputs.float()).cpu())
+        all_masks.append(masks.cpu())
+    
+    preds = torch.cat(all_preds)
+    targets = torch.cat(all_masks)
+    
+    best_th, best_iou = 0.5, 0.0
+    for th in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+        p = (preds > th).float()
+        inter = (p * targets).sum(dim=(2, 3))
+        uni = p.sum(dim=(2, 3)) + targets.sum(dim=(2, 3)) - inter
+        iou = ((inter + 1e-6) / (uni + 1e-6)).mean().item()
+        print(f"    Threshold {th:.2f} → IoU: {iou:.4f}")
+        if iou > best_iou:
+            best_iou = iou
+            best_th = th
+    print(f"  ✅ Best threshold: {best_th:.2f} (IoU: {best_iou:.4f})")
+    return best_th
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
@@ -264,18 +322,24 @@ def main():
     
     seed_everything(CFG.SEED)
     os.makedirs(CFG.MODEL_SAVE_DIR, exist_ok=True)
+    train_img_dir = resolve_existing_dir(CFG.TRAIN_IMG_CANDIDATES, "Segmentation training images")
+    train_mask_dir = resolve_existing_dir(CFG.TRAIN_MASK_CANDIDATES, "Segmentation training masks")
+    val_img_dir = resolve_existing_dir(CFG.VAL_IMG_CANDIDATES, "Segmentation validation images")
+    val_mask_dir = resolve_existing_dir(CFG.VAL_MASK_CANDIDATES, "Segmentation validation masks")
 
     print(f"\n{'='*60}")
     print(f"  🚀 V5 Kaggle Segmentation (Optimized)")
     print(f"  ⚡️ B2 + Robust Resize (224x224)")
     print(f"{'='*60}\n")
+    print(f"  📁 Train images: {train_img_dir}")
+    print(f"  📁 Val   images: {val_img_dir}")
 
     # Clear memory from previous runs
     gc.collect()
     torch.cuda.empty_cache()
 
-    train_ds = SegmentationDataset(CFG.TRAIN_IMG_DIR, CFG.TRAIN_MASK_DIR, get_train_transforms(CFG.IMG_SIZE))
-    val_ds = SegmentationDataset(CFG.VAL_IMG_DIR, CFG.VAL_MASK_DIR, get_val_transforms(CFG.IMG_SIZE))
+    train_ds = SegmentationDataset(train_img_dir, train_mask_dir, get_train_transforms(CFG.IMG_SIZE))
+    val_ds = SegmentationDataset(val_img_dir, val_mask_dir, get_val_transforms(CFG.IMG_SIZE))
 
     train_loader = DataLoader(train_ds, batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
@@ -292,7 +356,7 @@ def main():
 
     criterion = CombinedLoss(CFG.LOVASZ_WEIGHT, CFG.DICE_WEIGHT)
     optimizer = optim.AdamW(model.parameters(), lr=CFG.MAX_LR, weight_decay=CFG.WEIGHT_DECAY, foreach=True)
-    scaler = torch.amp.GradScaler('cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=str(CFG.DEVICE).startswith("cuda"))
 
     import math
     steps_per_epoch = math.ceil(len(train_loader) / CFG.GRAD_ACCUM_STEPS)
@@ -300,6 +364,7 @@ def main():
 
     preprocessor = GPUSegPreprocessor(CFG.DEVICE)
     best_iou = 0.0
+    no_improve_count = 0
     start_time = time.time()
 
     for epoch in range(1, CFG.EPOCHS + 1):
@@ -312,8 +377,13 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} | IoU: {train_iou:.4f}")
         print(f"  Val   Loss: {val_loss:.4f} | IoU: {val_iou:.4f} | ⏱️ {time.time()-t0:.0f}s")
 
+        gap = train_iou - val_iou
+        if gap > 0.15:
+            print(f"  ⚠️ Overfitting alert! Train-Val IoU gap: {gap:.4f}")
+
         if val_iou > best_iou:
             best_iou = val_iou
+            no_improve_count = 0
             state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
             checkpoint = {
                 "model_state_dict": state_dict,
@@ -325,11 +395,27 @@ def main():
             }
             torch.save(checkpoint, os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth"))
             print(f"  ✅ Best saved! IoU: {best_iou:.4f}")
+        else:
+            no_improve_count += 1
+            print(f"  ⏸️ No improvement ({no_improve_count}/{CFG.EARLY_STOP_PATIENCE})")
+            if no_improve_count >= CFG.EARLY_STOP_PATIENCE:
+                print(f"  🛑 Early stopping at epoch {epoch}!")
+                break
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    print(f"\n{'='*60}\n  ✅ V5 Training Done! Best IoU: {best_iou:.4f} | Total ⏱️ {(time.time()-start_time)/60:.1f} min\n{'='*60}")
+    # ── Threshold Optimization ──
+    print(f"\n🔍 Searching for optimal threshold on Validation set...")
+    best_th = find_best_threshold(model, val_loader, CFG.DEVICE, preprocessor)
+    
+    # Re-save best model with optimal threshold
+    best_ckpt = torch.load(os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth"), map_location=CFG.DEVICE, weights_only=False)
+    best_ckpt["best_threshold"] = best_th
+    torch.save(best_ckpt, os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth"))
+    print(f"  ✅ Threshold {best_th:.2f} saved to checkpoint")
+
+    print(f"\n{'='*60}\n  ✅ Training Done! Best IoU: {best_iou:.4f} | Optimal Threshold: {best_th:.2f} | Total ⏱️ {(time.time()-start_time)/60:.1f} min\n{'='*60}")
 
 if __name__ == "__main__":
     main()

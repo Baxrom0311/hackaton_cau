@@ -18,18 +18,29 @@ from PIL import Image
 # ==============================================================================
 
 # --- Helper Functions ---
-def robust_resize(img, sz):
+def robust_resize(img, sz, is_mask=False, return_meta=False):
     """Aspect-ratio preserving padding (Matches V5 Training)"""
     h, w = img.shape[:2]
     scale = sz / max(h, w)
     new_h, new_w = int(h * scale), int(w * scale)
-    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
+    img = cv2.resize(img, (new_w, new_h), interpolation=interp)
     
     pad_h = (sz - new_h) // 2
     pad_w = (sz - new_w) // 2
     img = cv2.copyMakeBorder(img, pad_h, sz - new_h - pad_h, pad_w, sz - new_w - pad_w, 
                             cv2.BORDER_CONSTANT, value=0)
+    if return_meta:
+        return img, {"pad_h": pad_h, "pad_w": pad_w, "new_h": new_h, "new_w": new_w}
     return img
+
+def restore_original_mask(prob_mask, orig_h, orig_w, resize_meta):
+    y0 = resize_meta["pad_h"]
+    x0 = resize_meta["pad_w"]
+    y1 = y0 + resize_meta["new_h"]
+    x1 = x0 + resize_meta["new_w"]
+    cropped = prob_mask[y0:y1, x0:x1]
+    return cv2.resize(cropped, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 @st.cache_resource
 def load_models(cls_path, seg_path, device):
     """Loads classification and segmentation models safely"""
@@ -41,7 +52,7 @@ def load_models(cls_path, seg_path, device):
         try:
             cls_ckpt = torch.load(cls_path, map_location=device, weights_only=False)
             cls_model = timm.create_model(
-                cls_ckpt.get("model_name", "tf_efficientnet_b5_ns"), 
+                cls_ckpt.get("model_name", "tf_efficientnet_b2.ns_jft_in1k"), 
                 pretrained=False, 
                 num_classes=cls_ckpt.get("num_classes", 12)
             )
@@ -55,7 +66,7 @@ def load_models(cls_path, seg_path, device):
         try:
             seg_ckpt = torch.load(seg_path, map_location=device, weights_only=False)
             seg_model = smp.UnetPlusPlus(
-                encoder_name=seg_ckpt.get("encoder", "timm-efficientnet-b5"),
+                encoder_name=seg_ckpt.get("encoder", "efficientnet-b2"),
                 encoder_weights=None,
                 in_channels=3, 
                 classes=1, 
@@ -63,57 +74,81 @@ def load_models(cls_path, seg_path, device):
             )
             seg_model.load_state_dict(seg_ckpt["model_state_dict"])
             seg_model.to(device).eval()
+            
+            # Extract metadata and store in model object temporarily for inference
+            seg_model.img_size = seg_ckpt.get("img_size", 224)
+            seg_model.best_threshold = seg_ckpt.get("best_threshold", 0.5)
+            
         except Exception as e:
             st.error(f"Segmentation Model Error: {e}")
             
     return cls_model, cls_ckpt, seg_model, seg_ckpt
 
-def get_base_transforms(img_size):
-    return A.Compose([
-        A.Resize(img_size, img_size),
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
+# get_base_transforms removed — was dead code using A.Resize (squash) instead of robust_resize
 
 @torch.no_grad()
 def run_classification(model, img_np, img_size, device):
     img_resized = robust_resize(img_np, img_size)
-    normalize = A.Compose([
+    base_tfm = A.Compose([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
-    tensor = normalize(image=img_resized)["image"].unsqueeze(0).to(device)
-    with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
-        logits = model(tensor)
-    probs = F.softmax(logits, dim=1).squeeze().cpu().numpy()
+
+    all_probs = []
+    tta_images = [
+        img_resized,
+        np.fliplr(img_resized).copy(),
+        np.flipud(img_resized).copy(),
+        np.rot90(img_resized, 1).copy(),
+    ]
+    for aug_img in tta_images:
+        tensor = base_tfm(image=aug_img)["image"].unsqueeze(0).to(device)
+        with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
+            logits = model(tensor)
+        all_probs.append(F.softmax(logits, dim=1))
+
+    probs = torch.stack(all_probs).mean(dim=0).squeeze().cpu().numpy()
     pred_class = np.argmax(probs)
     return pred_class, probs
+
+def postprocess_mask(mask_binary):
+    mask = mask_binary.astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        mask = (labels == largest).astype(np.uint8)
+    return mask
 
 @torch.no_grad()
 def run_segmentation(model, img_np, img_size, device):
     h_orig, w_orig = img_np.shape[:2]
-    img_resized = robust_resize(img_np, img_size)
+    img_resized, resize_meta = robust_resize(img_np, img_size, return_meta=True)
     
-    normalize = A.Compose([
+    base_tfm = A.Compose([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
-    tensor = normalize(image=img_resized)["image"].unsqueeze(0).to(device)
-    with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
-        logits = model(tensor)
-    prob_mask = torch.sigmoid(logits.float()).squeeze().cpu().numpy()
+
+    def predict_single(image):
+        tensor = base_tfm(image=image)["image"].unsqueeze(0).to(device)
+        with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
+            logits = model(tensor)
+        return torch.sigmoid(logits.float()).squeeze().cpu().numpy().astype(np.float32)
+
+    preds = [
+        predict_single(img_resized),
+        np.fliplr(predict_single(np.fliplr(img_resized).copy())),
+        np.flipud(predict_single(np.flipud(img_resized).copy())),
+        np.rot90(predict_single(np.rot90(img_resized, 1).copy()), -1),
+    ]
+
+    prob_mask = np.mean(preds, axis=0).astype(np.float32)
+    prob_mask = restore_original_mask(prob_mask, h_orig, w_orig, resize_meta)
     
-    binary_mask = (prob_mask > 0.5).astype(np.uint8)
-    
-    # 1. Resize binary mask back to padded size pixels
-    # 2. Then crop out the padding (or just resize back to original)
-    # The training logic used padding, so the model expects padded input.
-    # To get back to original, we just resize INTER_NEAREST back to orig.
-    binary_mask = cv2.resize(binary_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
-    
-    # Morphology
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+    threshold = getattr(model, "best_threshold", 0.5)
+    binary_mask = postprocess_mask((prob_mask > threshold).astype(np.uint8))
     return binary_mask
 
 def draw_overlay(image_np, mask_np):
@@ -140,8 +175,8 @@ st.markdown("Automated image classification and region segmentation using deep l
 # Sidebar - Settings
 with st.sidebar:
     st.header("⚙️ Configuration")
-    cls_model_path = st.text_input("Classification Model Path", "models/classification_best.pth")
-    seg_model_path = st.text_input("Segmentation Model Path", "models/segmentation_best.pth")
+    cls_model_path = st.text_input("Classification Model Path", "models/classification/best_model.pth")
+    seg_model_path = st.text_input("Segmentation Model Path", "models/segmentation/best_model.pth")
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     st.info(f"Using compute device: **{device.upper()}**")
 

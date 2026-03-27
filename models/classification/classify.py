@@ -17,16 +17,28 @@ import torch
 import timm
 import numpy as np
 import pandas as pd
+import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from tqdm import tqdm
 
+def robust_resize(img, sz):
+    h, w = img.shape[:2]
+    scale = sz / max(h, w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    pad_h = (sz - new_h) // 2
+    pad_w = (sz - new_w) // 2
+    img = cv2.copyMakeBorder(img, pad_h, sz - new_h - pad_h, pad_w, sz - new_w - pad_w, cv2.BORDER_CONSTANT, value=0)
+    return img
+
 
 class TestDataset(Dataset):
-    def __init__(self, image_dir, transform=None):
+    def __init__(self, image_dir, img_size, transform=None):
         self.image_dir = image_dir
+        self.img_size = img_size
         self.transform = transform
         self.image_files = sorted([
             f for f in os.listdir(image_dir)
@@ -39,6 +51,7 @@ class TestDataset(Dataset):
     def __getitem__(self, idx):
         fname = self.image_files[idx]
         img = np.array(Image.open(os.path.join(self.image_dir, fname)).convert("RGB"))
+        img = robust_resize(img, self.img_size)
         image_id = os.path.splitext(fname)[0]
 
         if self.transform:
@@ -47,9 +60,8 @@ class TestDataset(Dataset):
         return img, image_id
 
 
-def get_test_transforms(img_size):
+def get_test_transforms():
     return A.Compose([
-        A.Resize(img_size, img_size),
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
@@ -82,7 +94,7 @@ def main():
     model.eval()
 
     # Dataset & Loader
-    test_dataset = TestDataset(test_dir, transform=get_test_transforms(img_size))
+    test_dataset = TestDataset(test_dir, img_size=img_size, transform=get_test_transforms())
     test_loader = DataLoader(
         test_dataset, batch_size=64,
         shuffle=False, num_workers=4, pin_memory=True

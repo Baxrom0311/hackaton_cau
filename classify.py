@@ -89,11 +89,14 @@ def main():
         
     print(f"🚀 Loading Classification Model on {device}: {args.model_path}")
     ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
-    
-    model = timm.create_model(ckpt.get("model_name", "tf_efficientnet_b5_ns"), pretrained=False, num_classes=ckpt.get("num_classes", 12))
+    num_classes = ckpt.get("num_classes", 12)
+    val_acc = ckpt.get("val_acc")
+
+    model = timm.create_model(ckpt.get("model_name", "tf_efficientnet_b2.ns_jft_in1k"), pretrained=False, num_classes=num_classes)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
-    print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, Acc: {ckpt.get('val_acc', '?'):.4f})")
+    val_acc_text = f"{val_acc:.4f}" if isinstance(val_acc, (int, float)) else "N/A"
+    print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, Acc: {val_acc_text})")
 
     img_size = ckpt.get("img_size", 224)
     files = sorted([f for f in os.listdir(args.test_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
@@ -105,9 +108,10 @@ def main():
         try:
             img = np.array(Image.open(path).convert("RGB"))
             pred = predict_tta(model, img, img_size, device)
+            if not 0 <= pred < num_classes:
+                raise ValueError(f"Predicted label {pred} is outside 0..{num_classes - 1}")
         except Exception as e:
-            print(f"\n⚠️ Error processing {f}: {e}")
-            pred = -1  # Invalid/Error class
+            raise RuntimeError(f"Error processing {f}: {e}") from e
 
         all_ids.append(os.path.splitext(f)[0])
         all_preds.append(pred)

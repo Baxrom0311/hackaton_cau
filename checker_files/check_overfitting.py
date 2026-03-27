@@ -10,6 +10,7 @@ import os
 import torch
 import torch.nn.functional as F
 import timm
+import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
@@ -33,9 +34,21 @@ TRAIN_DIR = find_train_dir()
 
 device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
+def robust_resize(img, sz):
+    """Aspect-ratio preserving padding (Matches V5 Training)"""
+    h, w = img.shape[:2]
+    scale = sz / max(h, w)
+    new_h, new_w = int(h * scale), int(w * scale)
+    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    pad_h = (sz - new_h) // 2
+    pad_w = (sz - new_w) // 2
+    img = cv2.copyMakeBorder(img, pad_h, sz - new_h - pad_h, pad_w, sz - new_w - pad_w,
+                            cv2.BORDER_CONSTANT, value=0)
+    return img
+
 def get_transforms(img_size):
     return A.Compose([
-        A.Resize(img_size, img_size),
+        # Resize is handled by robust_resize (aspect-ratio preserving padding)
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
@@ -84,6 +97,7 @@ def check_overfitting():
         files = os.listdir(d)[:20] # har bir klassdan 20 tadan (jami 240 ta rasm)
         for f in tqdm(files, desc=f"Tekshirish (Class {cls_id})", leave=False):
             img = np.array(Image.open(os.path.join(d, f)).convert("RGB"))
+            img = robust_resize(img, img_size)  # Match V5 training preprocessing
             tensor = tfm(image=img)["image"].unsqueeze(0).to(device)
             with torch.no_grad():
                 with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
