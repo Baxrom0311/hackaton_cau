@@ -249,11 +249,10 @@ def validate(model, loader, criterion, device, preprocessor):
         
         # TTA
         with torch.amp.autocast(amp_device, enabled=amp_enabled):
-            outputs = model(imgs)
-            outputs_flip = model(torch.flip(imgs, dims=[3]))
-        outputs = (outputs + outputs_flip) / 2.0
-        
-        loss = criterion(outputs, labels)
+            out1 = model(imgs)
+            out2 = model(torch.flip(imgs, dims=[3]))
+            outputs = (out1 + out2) / 2.0
+            loss = criterion(outputs, labels)
         running_loss += loss.item() * imgs.size(0)
         correct += (outputs.argmax(1) == labels).sum().item()
         n += imgs.size(0)
