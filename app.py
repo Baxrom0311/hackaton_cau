@@ -163,81 +163,218 @@ def draw_overlay(image_np, mask_np):
     cv2.drawContours(overlay, contours, -1, (255, 255, 0), 2) # Yellow border
     return overlay
 
-# --- UI Setup ---
-st.set_page_config(page_title="Biopsy AI Analysis", page_icon="🧬", layout="wide")
+# --- UI Setup & Premium CSS ---
+st.set_page_config(page_title="Biopsy AI Analysis", page_icon="🧬", layout="wide", initial_sidebar_state="collapsed")
 
-# DISCLAIMER (MANDATORY BY GUIDELINES)
-st.warning("⚠️ **For research and demonstration purposes only. Not for clinical use.**")
+# Inject Custom Premium CSS (Glassmorphism, Animations, Modern Fonts)
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    /* Main Background Gradient */
+    .stApp {
+        background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+        color: #f8fafc;
+    }
+    
+    /* Glassmorphic Container */
+    .glass-container {
+        background: rgba(255, 255, 255, 0.03);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border-radius: 20px;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        padding: 30px;
+        box-shadow: 0 4px 30px rgba(0, 0, 0, 0.3);
+        margin-bottom: 20px;
+        animation: fadeIn 0.8s ease-out;
+    }
+    
+    /* Typography & Glow */
+    .title-glow {
+        font-size: 3rem;
+        font-weight: 800;
+        background: -webkit-linear-gradient(45deg, #38bdf8, #818cf8, #c084fc);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-align: center;
+        margin-bottom: 5px;
+        text-shadow: 0px 0px 20px rgba(129, 140, 248, 0.4);
+    }
+    .subtitle {
+        text-align: center;
+        color: #94a3b8;
+        font-size: 1.1rem;
+        margin-bottom: 30px;
+        font-weight: 300;
+    }
+    
+    /* Disclaimer Banner */
+    .disclaimer {
+        background: rgba(239, 68, 68, 0.1);
+        border-left: 4px solid #ef4444;
+        color: #fca5a5;
+        padding: 12px 20px;
+        border-radius: 8px;
+        font-size: 0.9rem;
+        font-weight: 600;
+        text-align: center;
+        margin-bottom: 30px;
+    }
+    
+    /* Image Wrappers */
+    .img-wrapper {
+        border-radius: 12px;
+        overflow: hidden;
+        border: 2px solid rgba(255,255,255,0.05);
+        box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+        transition: transform 0.3s ease;
+    }
+    .img-wrapper:hover {
+        transform: scale(1.02);
+        border-color: rgba(56, 189, 248, 0.5);
+    }
+    
+    /* Metric Cards */
+    .metric-card {
+        background: rgba(15, 23, 42, 0.6);
+        border: 1px solid rgba(56, 189, 248, 0.2);
+        border-radius: 12px;
+        padding: 20px;
+        text-align: center;
+        margin-top: 15px;
+    }
+    .metric-value {
+        font-size: 2.5rem;
+        font-weight: 800;
+        color: #38bdf8;
+    }
+    .metric-label {
+        font-size: 0.9rem;
+        color: #cbd5e1;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+    
+    /* Custom Animations */
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(20px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    /* Hide Streamlit components */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
 
-st.title("🔬 AI Healthcare Biopsy Analyzer")
-st.markdown("Automated image classification and region segmentation using deep learning.")
+# ─── App Header ───
+st.markdown('<div class="disclaimer">⚠️ For research and demonstration purposes only. Not for clinical use.</div>', unsafe_allow_html=True)
+st.markdown('<div class="title-glow">🔬 AI Biopsy Diagnostic System</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Next-Generation Classification & Segmentation powered by Deep Learning</div>', unsafe_allow_html=True)
 
-# Sidebar - Settings
+# ─── Sidebar Settings (Hidden by default for clean UI) ───
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    st.header("⚙️ System Configuration")
     cls_model_path = st.text_input("Classification Model Path", "models/classification/best_model.pth")
     seg_model_path = st.text_input("Segmentation Model Path", "models/segmentation/best_model.pth")
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    st.info(f"Using compute device: **{device.upper()}**")
+    st.info(f"Compute Engine: **{device.upper()}**")
 
 # Load Models
 cls_model, cls_ckpt, seg_model, seg_ckpt = load_models(cls_model_path, seg_model_path, device)
 
-# Main App
-uploaded_file = st.file_uploader("Upload a Biopsy Image (PNG/JPG)", type=["png", "jpg", "jpeg"])
+# ─── Main Interface ───
+st.markdown('<div class="glass-container">', unsafe_allow_html=True)
+uploaded_file = st.file_uploader("📥 Upload Biopsy Image (PNG/JPG)", type=["png", "jpg", "jpeg"])
+st.markdown('</div>', unsafe_allow_html=True)
 
 if uploaded_file is not None:
     # Read Image
     image = Image.open(uploaded_file).convert("RGB")
     image_np = np.array(image)
     
-    col1, col2 = st.columns(2)
+    st.markdown('<div class="glass-container">', unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 1], gap="large")
     
     with col1:
-        st.subheader("Original Image")
-        st.image(image, use_column_width=True)
+        st.markdown("### 📸 Original Biopsy Image")
+        st.image(image, use_column_width=True, clamp=True)
         
     with col2:
-        st.subheader("AI Analysis Results")
+        st.markdown("### 🤖 Clinical AI Insights")
         
         # 1. Classification
         if cls_model is not None:
-            with st.spinner("Running Classification..."):
-                cls_size = cls_ckpt.get("img_size", 512)
+            with st.spinner("🔬 Running Deep Classification..."):
+                cls_size = cls_ckpt.get("img_size", 224)
                 pred_class, probs = run_classification(cls_model, image_np, cls_size, device)
                 confidence = float(probs[pred_class])
                 
-                if confidence < 0.40:
-                    st.warning("⚠️ **Low Confidence (OOD)**: This image might not be a standard biopsy or belongs to an unknown class.")
-                else:
-                    st.success(f"**Predicted Disease Class:** Class {pred_class}")
-                    
-                st.progress(confidence, text=f"Confidence Score: {confidence*100:.1f}%")
+                # Dynamic Metric Card
+                color = "#22c55e" if confidence > 0.8 else ("#eab308" if confidence > 0.5 else "#ef4444")
+                st.markdown(f"""
+                <div class="metric-card" style="border-left: 4px solid {color};">
+                    <div class="metric-label">Predicted Disease Class</div>
+                    <div class="metric-value">Class {pred_class}</div>
+                    <div class="metric-label" style="text-transform: none; margin-top: 5px; color: {color};">
+                        Confidence: {(confidence * 100):.1f}%
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
                 
-                # Confidence Breakdown
-                import pandas as pd
-                prob_df = pd.DataFrame({
-                    "Class": [f"Class {i}" for i in range(len(probs))],
-                    "Probability": probs
-                })
-                st.bar_chart(prob_df.set_index("Class"))
+                if confidence < 0.40:
+                    st.warning("⚠️ **Low Confidence**: Artifact detected or Out-of-Distribution sample.")
+                
+                with st.expander("📊 View Probability Distribution"):
+                    prob_df = pd.DataFrame({"Probability": probs})
+                    st.bar_chart(prob_df)
         else:
-            st.error("Classification model not loaded.")
+            st.error("Classification module offline.")
             
         # 2. Segmentation
         if seg_model is not None:
-            with st.spinner("Running ROI Segmentation..."):
-                seg_size = seg_ckpt.get("img_size", 512)
+            st.markdown("---")
+            with st.spinner("🔬 Mapping Region of Interest (ROI)..."):
+                seg_size = seg_ckpt.get("img_size", 224)
                 mask = run_segmentation(seg_model, image_np, seg_size, device)
                 overlay_img = draw_overlay(image_np, mask)
-                st.image(overlay_img, caption="Segmented Region of Interest", use_column_width=True)
+                
+                st.markdown("### 🎯 AI Segmentation Map")
+                st.image(overlay_img, use_column_width=True)
                 
                 # Stats
-                pixel_count = np.sum(mask)
+                pixel_count = int(np.sum(mask))
                 total_pixels = mask.size
-                st.info(f"**Lesion Area:** {pixel_count} pixels ({pixel_count/total_pixels*100:.2f}% of image)")
+                percentage = (pixel_count / total_pixels) * 100
+                
+                st.markdown(f"""
+                <div style="display: flex; gap: 15px; margin-top: 15px;">
+                    <div class="metric-card" style="flex: 1; padding: 10px;">
+                        <div class="metric-label">Lesion Pixel Area</div>
+                        <div style="font-size: 1.5rem; color: #a855f7; font-weight: bold;">{pixel_count:,} px</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; padding: 10px;">
+                        <div class="metric-label">Tissue Proportion</div>
+                        <div style="font-size: 1.5rem; color: #ec4899; font-weight: bold;">{percentage:.2f}%</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
         else:
-            st.error("Segmentation model not loaded.")
+            st.error("Segmentation module offline.")
             
+    st.markdown('</div>', unsafe_allow_html=True) # End glass container
 else:
-    st.info("Please upload an image to begin the analysis.")
+    st.markdown("""
+    <div style="text-align: center; padding: 50px; color: #64748b;">
+        <h2 style="font-weight: 300;">Ready for Analysis</h2>
+        <p>Upload a biopsy image above to trigger the AI pipeline.</p>
+    </div>
+    """, unsafe_allow_html=True)
+

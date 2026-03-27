@@ -49,25 +49,25 @@ class CFG:
         f"{BASE}/Segmentation/validation/masks",
         f"{BASE}/segmentation/validation/masks",
     ]
-    MODEL_SAVE_DIR = "segmentation_v5"
+    MODEL_SAVE_DIR = "segmentation_v6_ultra"
 
-    ENCODER = "efficientnet-b2"
+    ENCODER = "efficientnet-b4"
     ENCODER_WEIGHTS = "imagenet"
     DECODER = "UnetPlusPlus"
 
-    EPOCHS = 40
-    BATCH_SIZE = 32
-    MAX_LR = 8e-4
-    WEIGHT_DECAY = 1e-5
+    EPOCHS = 50
+    BATCH_SIZE = 8
+    MAX_LR = 5e-4
+    WEIGHT_DECAY = 1e-4
     NUM_WORKERS = 0                   # In-Memory optimization
-    IMG_SIZE = 224
+    IMG_SIZE = 384                    # 🚀 BOOSTED RESOLUTION For >0.85 IoU
     SEED = 42
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    GRAD_ACCUM_STEPS = 1
+    GRAD_ACCUM_STEPS = 2
     GRAD_CLIP = 5.0
-    LOVASZ_WEIGHT = 0.5
-    DICE_WEIGHT = 0.5
-    EARLY_STOP_PATIENCE = 7
+    LOVASZ_WEIGHT = 0.75              # 🚀 Focus on Intersection over Union directly
+    DICE_WEIGHT = 0.25
+    EARLY_STOP_PATIENCE = 10
 
 def robust_resize(img, sz, is_mask=False):
     """Aspect-ratio preserving padding (Ultra Quality)"""
@@ -190,12 +190,13 @@ def get_train_transforms(sz):
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
         A.ShiftScaleRotate(shift_limit=0.0625, scale_limit=0.1, rotate_limit=15, p=0.5),
+        A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.3),  # 🚀 BIOPSY OPTIMIZED (Cells distortion)
         A.OneOf([
             A.CLAHE(clip_limit=4.0, p=1.0),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, p=1.0),
         ], p=0.3),
         A.ElasticTransform(alpha=50, sigma=5, p=0.15),
-        A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(8, 16), hole_width_range=(8, 16), p=0.15), # Removed fill_value
+        A.CoarseDropout(num_holes_range=(1, 4), hole_height_range=(16, 32), hole_width_range=(16, 32), p=0.15),
         ToTensorV2(),
     ])
 

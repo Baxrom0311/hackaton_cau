@@ -52,35 +52,43 @@ def main():
     os.makedirs(team_root)
 
     # 1. Excel File
-    shutil.copy(args.excel_path, os.path.join(team_root, f"{args.team} test_ground_truth.xlsx"))
+    excel_dest = os.path.join(team_root, f"{args.team} test_ground_truth.xlsx")
+    shutil.copy(args.excel_path, excel_dest)
 
-    # 2. Masks Folder (Copying inside the submission folder)
-    dest_masks_dir = os.path.join(team_root, args.team)
+    # 2. Masks Folder
+    masks_folder_name = f"{args.team} masks"
+    dest_masks_dir = os.path.join(team_root, masks_folder_name)
     if os.path.abspath(args.masks_dir) != os.path.abspath(dest_masks_dir):
         shutil.copytree(args.masks_dir, dest_masks_dir)
-    else:
-        print("Warning: Input masks_dir and output team directory are the same. Check implementation.")
-
-    # 3. Models & Scripts Folder
-    models_dir = os.path.join(team_root, "models")
-    os.makedirs(os.path.join(models_dir, "classification"))
-    os.makedirs(os.path.join(models_dir, "segmentation"))
-
-    # Copy Scripts
-    shutil.copy("classify.py", os.path.join(models_dir, "classification", "classify.py"))
-    shutil.copy("segment.py", os.path.join(models_dir, "segmentation", "segment.py"))
     
-    # Copy Models
-    shutil.copy(args.cls_model, os.path.join(models_dir, "classification", "best_model.pth"))
-    shutil.copy(args.seg_model, os.path.join(models_dir, "segmentation", "best_model.pth"))
+    # Compress masks folder to TeamName masks.zip
+    shutil.make_archive(dest_masks_dir, 'zip', dest_masks_dir)
+    shutil.rmtree(dest_masks_dir) # Remove the unzipped folder to leave only the .zip
 
-    # Copy Requirements
-    if os.path.exists("requirements.txt"):
-        shutil.copy("requirements.txt", os.path.join(models_dir, "classification", "requirements.txt"))
-        shutil.copy("requirements.txt", os.path.join(models_dir, "segmentation", "requirements.txt"))
+    # 3. Code Python Scripts
+    class_py_dest = os.path.join(team_root, f"{args.team}Class.py")
+    seg_py_dest = os.path.join(team_root, f"{args.team}Seg.py")
+    shutil.copy("classify.py", class_py_dest)
+    shutil.copy("segment.py", seg_py_dest)
 
-    print(f"✅ Submission folder '{team_root}' created successfully!")
-    print(f"📦 ZIP this folder and upload to Google Form.")
+    # 4. Models
+    cls_ext = os.path.splitext(args.cls_model)[1]
+    seg_ext = os.path.splitext(args.seg_model)[1]
+    class_model_dest = os.path.join(team_root, f"{args.team}ClassModel{cls_ext}")
+    seg_model_dest = os.path.join(team_root, f"{args.team}SegModel{seg_ext}")
+    
+    shutil.copy(args.cls_model, class_model_dest)
+    shutil.copy(args.seg_model, seg_model_dest)
+
+    print(f"\n✅ SUBMISSION FOLDER '{team_root}' TAYYORLANDI!")
+    print(f"Ushbu papka ichida roppa-rosa Google form suragan 6 ta fayl joylashgan:")
+    print(f" 1. {os.path.basename(excel_dest)}")
+    print(f" 2. {masks_folder_name}.zip")
+    print(f" 3. {os.path.basename(class_py_dest)}")
+    print(f" 4. {os.path.basename(seg_py_dest)}")
+    print(f" 5. {os.path.basename(class_model_dest)}")
+    print(f" 6. {os.path.basename(seg_model_dest)}")
+    print("\n📦 Bularni to'g'ridan to'g'ri bittalab Google Form'ga yuklang!")
 
 if __name__ == "__main__":
     main()
