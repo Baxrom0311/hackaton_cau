@@ -164,10 +164,17 @@ def build_hard_manifest(rows, train_dir, output_path, val_fraction):
             distance = 0.0
             for name in feature_names:
                 distance += abs(centroid[name] - cls_mean[name]) / global_std[name]
+            enriched_rows = []
+            for row in bucket_rows:
+                row_distance = 0.0
+                for name in feature_names:
+                    row_distance += abs(row[name] - cls_mean[name]) / global_std[name]
+                enriched_rows.append((row_distance, row))
+            enriched_rows.sort(key=lambda item: (-item[0], item[1]["path"]))
             bucket_infos.append(
                 {
                     "bucket": bucket_name,
-                    "rows": bucket_rows,
+                    "rows": [row for _, row in enriched_rows],
                     "count": len(bucket_rows),
                     "distance": distance,
                 }
@@ -175,30 +182,39 @@ def build_hard_manifest(rows, train_dir, output_path, val_fraction):
 
         bucket_infos.sort(key=lambda row: (-row["distance"], -row["count"], row["bucket"]))
 
-        picked = []
         picked_count = 0
+        val_row_paths = set()
+        picked_summary = []
         for info in bucket_infos:
             if picked_count >= target:
                 break
-            picked.append(info)
-            picked_count += info["count"]
+            remaining = target - picked_count
+            selected_rows = info["rows"][:remaining]
+            for row in selected_rows:
+                val_row_paths.add(row["path"])
+            selected_count = len(selected_rows)
+            picked_count += selected_count
+            picked_summary.append((info["bucket"], selected_count, round(info["distance"], 3)))
 
-        picked_buckets = {info["bucket"] for info in picked}
-        holdout_summary[label] = [(info["bucket"], info["count"], round(info["distance"], 3)) for info in picked]
+        holdout_summary[label] = {
+            "target": target,
+            "selected": picked_count,
+            "buckets": picked_summary,
+        }
         for row in cls_rows:
             entry = {
                 "path": os.path.relpath(row["path"], train_dir),
                 "label": int(label),
                 "style_bucket": row["style_bucket"],
             }
-            if row["style_bucket"] in picked_buckets:
+            if row["path"] in val_row_paths:
                 val_rows.append(entry)
             else:
                 train_rows.append(entry)
 
     payload = {
         "root_dir": train_dir,
-        "method": "style_outlier_holdout_v1",
+        "method": "style_outlier_holdout_v2_exact_fraction",
         "val_fraction": val_fraction,
         "train_count": len(train_rows),
         "val_count": len(val_rows),

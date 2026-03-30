@@ -22,10 +22,12 @@ import numpy as np
 import cv2
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from collections import Counter
 from tqdm import tqdm
 import timm
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ─── Google Drive Support ────────────────────────────────────────────────────
 try:
@@ -70,6 +72,10 @@ class CFG:
     TRAIN_DIR = f"{BASE}/classification/train"
     MODEL_SAVE_DIR = "/content/drive/MyDrive/hackaton_models/classification_v6"
     SPLIT_MANIFEST_PATH = None
+    DEFAULT_SPLIT_MANIFEST_CANDIDATES = [
+        os.path.join(SCRIPT_DIR, "classification_hard_split_manifest.json"),
+        os.path.join(os.getcwd(), "classification_hard_split_manifest.json"),
+    ]
 
     MODEL_NAME = "tf_efficientnet_b4.ns_jft_in1k"  # SOTA: B4 + Noisy-Student
     IMG_SIZE = 380                                   # B4 optimal resolution
@@ -91,6 +97,8 @@ class CFG:
     CUTMIX_PROB = 0.5                                # 50% chance CutMix vs Mixup
     VAL_FRACTION = 0.1
     SPLIT_SEED = 42
+    USE_WEIGHTED_SAMPLER = True
+    SAMPLER_POWER = 0.5
 
 def robust_resize(img, sz):
     """Aspect-ratio preserving padding (Ultra Quality)"""
@@ -174,6 +182,82 @@ def load_split_manifest(path, root_dir):
         ]
 
     return deserialize(payload["train"]), deserialize(payload["val"])
+
+
+def resolve_split_manifest_path(cfg):
+    candidates = []
+    if cfg.SPLIT_MANIFEST_PATH:
+        candidates.append(cfg.SPLIT_MANIFEST_PATH)
+    candidates.extend(getattr(cfg, "DEFAULT_SPLIT_MANIFEST_CANDIDATES", []))
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def build_weighted_sampler(labels, num_classes, seed, power):
+    label_counts = Counter(int(label) for label in labels)
+    total_samples = sum(label_counts.values())
+    class_weights = {
+        cls_id: total_samples / (num_classes * label_counts.get(cls_id, 1))
+        for cls_id in range(num_classes)
+    }
+    sample_weights = [float(class_weights[int(label)] ** power) for label in labels]
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(sample_weights, dtype=torch.double),
+        num_samples=len(sample_weights),
+        replacement=True,
+        generator=generator,
+    )
+    return sampler, class_weights
+
+
+def file_sha256(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cfg_to_dict(cfg):
+    payload = {}
+    for key, value in cfg.__dict__.items():
+        if key.startswith("_") or callable(value):
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            payload[key] = value
+        elif isinstance(value, (list, tuple)):
+            payload[key] = list(value)
+    return payload
+
+
+def build_run_metadata(cfg, manifest_path, train_items, val_items, label_counts):
+    metadata = {
+        "config": cfg_to_dict(cfg),
+        "train_count": len(train_items),
+        "val_count": len(val_items),
+        "train_label_counts": {str(key): int(value) for key, value in sorted(label_counts.items())},
+        "package_versions": {
+            "torch": torch.__version__,
+            "timm": getattr(timm, "__version__", "unknown"),
+            "albumentations": getattr(A, "__version__", "unknown"),
+            "numpy": np.__version__,
+        },
+    }
+    if manifest_path and os.path.exists(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest_payload = json.load(handle)
+        metadata["split_manifest_path"] = manifest_path
+        metadata["split_manifest_sha256"] = file_sha256(manifest_path)
+        metadata["split_method"] = manifest_payload.get("method", "manifest")
+    else:
+        metadata["split_method"] = "stratified_random"
+    return metadata
 
 # ─── Dataset ────────────────────────────────────────────────────────────────
 class ClassificationDataset(Dataset):
@@ -399,9 +483,9 @@ def main():
     print(f"  ⚡️ EfficientNet-B2 + Robust Padding + TTA")
     print(f"{'='*60}\n")
 
-    if CFG.SPLIT_MANIFEST_PATH and os.path.exists(CFG.SPLIT_MANIFEST_PATH):
-        train_items, val_items = load_split_manifest(CFG.SPLIT_MANIFEST_PATH, CFG.TRAIN_DIR)
-        manifest_path = CFG.SPLIT_MANIFEST_PATH
+    manifest_path = resolve_split_manifest_path(CFG)
+    if manifest_path:
+        train_items, val_items = load_split_manifest(manifest_path, CFG.TRAIN_DIR)
         print(f"  🧾 Using split manifest: {manifest_path}")
     else:
         train_items, val_items = build_classification_split(CFG.TRAIN_DIR, CFG.VAL_FRACTION, CFG.SPLIT_SEED)
@@ -412,7 +496,21 @@ def main():
     train_ds = ClassificationDataset(train_items, get_train_transforms(CFG.IMG_SIZE), "train")
     val_ds = ClassificationDataset(val_items, get_val_transforms(CFG.IMG_SIZE), "val")
     
-    train_loader = DataLoader(train_ds, batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=CFG.NUM_WORKERS, pin_memory=True)
+    sampler = None
+    if CFG.USE_WEIGHTED_SAMPLER:
+        sampler, sampler_class_weights = build_weighted_sampler(train_ds.labels.tolist(), CFG.NUM_CLASSES, CFG.SEED, CFG.SAMPLER_POWER)
+        print(
+            "  ⚖️ Weighted sampler enabled: "
+            + ", ".join(f"{cls}:{sampler_class_weights[cls]:.2f}" for cls in range(CFG.NUM_CLASSES))
+        )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=CFG.BATCH_SIZE,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=CFG.NUM_WORKERS,
+        pin_memory=True,
+    )
     val_loader = DataLoader(val_ds, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=CFG.NUM_WORKERS, pin_memory=True)
 
     model = timm.create_model(CFG.MODEL_NAME, pretrained=True, num_classes=CFG.NUM_CLASSES, drop_rate=CFG.DROP_RATE).to(CFG.DEVICE)
@@ -426,6 +524,7 @@ def main():
         dtype=torch.float32
     ).to(CFG.DEVICE)
     print(f"  📊 Class weights: {', '.join(f'{w:.2f}' for w in class_weights.tolist())}")
+    run_metadata = build_run_metadata(CFG, manifest_path, train_items, val_items, label_counts)
 
     criterion = FocalLoss(label_smoothing=CFG.LABEL_SMOOTHING, class_weights=class_weights)
     optimizer = optim.AdamW(model.parameters(), lr=CFG.MAX_LR, weight_decay=CFG.WEIGHT_DECAY)
@@ -464,9 +563,11 @@ def main():
                 "num_classes": CFG.NUM_CLASSES,
                 "img_size": CFG.IMG_SIZE,
                 "val_acc": best_acc,
+                "epoch": epoch,
                 "split_seed": CFG.SPLIT_SEED,
                 "val_fraction": CFG.VAL_FRACTION,
                 "split_manifest_path": manifest_path,
+                "run_metadata": run_metadata,
             }
             torch.save(checkpoint, os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth"))
             print(f"  ✅ Best saved! Accuracy: {best_acc:.4f}")
