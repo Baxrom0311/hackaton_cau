@@ -19,8 +19,8 @@ import numpy as np
 import pandas as pd
 import cv2
 import albumentations as A
+import torch.nn.functional as F
 from albumentations.pytorch import ToTensorV2
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from tqdm import tqdm
 
@@ -35,36 +35,33 @@ def robust_resize(img, sz):
     return img
 
 
-class TestDataset(Dataset):
-    def __init__(self, image_dir, img_size, transform=None):
-        self.image_dir = image_dir
-        self.img_size = img_size
-        self.transform = transform
-        self.image_files = sorted([
-            f for f in os.listdir(image_dir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        ])
-
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, idx):
-        fname = self.image_files[idx]
-        img = np.array(Image.open(os.path.join(self.image_dir, fname)).convert("RGB"))
-        img = robust_resize(img, self.img_size)
-        image_id = os.path.splitext(fname)[0]
-
-        if self.transform:
-            img = self.transform(image=img)["image"]
-
-        return img, image_id
-
-
 def get_test_transforms():
     return A.Compose([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
+
+
+@torch.no_grad()
+def predict_tta(model, image, img_size, device, transform):
+    resized = robust_resize(image, img_size)
+    tta_images = [
+        resized,
+        np.fliplr(resized).copy(),
+        np.flipud(resized).copy(),
+        np.rot90(resized, 1).copy(),
+    ]
+    probs = []
+    for aug_img in tta_images:
+        tensor = transform(image=aug_img)["image"].unsqueeze(0).to(device)
+        logits = model(tensor)
+        probs.append(F.softmax(logits, dim=1))
+    return torch.stack(probs).mean(dim=0).argmax(dim=1).item()
+
+
+def image_id_sort_key(value):
+    value = str(value)
+    return (0, int(value)) if value.isdigit() else (1, value)
 
 
 @torch.no_grad()
@@ -93,33 +90,27 @@ def main():
     model.to(device)
     model.eval()
 
-    # Dataset & Loader
-    test_dataset = TestDataset(test_dir, img_size=img_size, transform=get_test_transforms())
-    test_loader = DataLoader(
-        test_dataset, batch_size=64,
-        shuffle=False, num_workers=4, pin_memory=True
+    transform = get_test_transforms()
+    image_files = sorted(
+        f for f in os.listdir(test_dir)
+        if f.lower().endswith((".png", ".jpg", ".jpeg"))
     )
-
-    print(f"Total test images: {len(test_dataset)}")
+    print(f"Total test images: {len(image_files)}")
 
     # Inference
     all_ids = []
     all_preds = []
 
-    for images, image_ids in tqdm(test_loader, desc="Predicting"):
-        images = images.to(device)
-        outputs = model(images)
-        preds = outputs.argmax(dim=1).cpu().numpy()
-
-        all_ids.extend(image_ids)
-        all_preds.extend(preds)
+    for image_name in tqdm(image_files, desc="Predicting"):
+        image_path = os.path.join(test_dir, image_name)
+        image = np.array(Image.open(image_path).convert("RGB"))
+        pred = predict_tta(model, image, img_size, device, transform)
+        all_ids.append(os.path.splitext(image_name)[0])
+        all_preds.append(pred)
 
     # Save to Excel
-    df = pd.DataFrame({
-        "Image_ID": [int(x) for x in all_ids],
-        "Label": [int(x) for x in all_preds]
-    })
-    df = df.sort_values("Image_ID").reset_index(drop=True)
+    rows = sorted(zip(all_ids, all_preds), key=lambda row: image_id_sort_key(row[0]))
+    df = pd.DataFrame(rows, columns=["Image_ID", "Label"])
 
     output_file = "test_ground_truth.xlsx"
     df.to_excel(output_file, index=False)

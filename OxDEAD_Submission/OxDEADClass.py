@@ -1,10 +1,14 @@
 # ============================================================
 # AI Healthcare Hackathon 2026 — Inference: Classification
 # ============================================================
-# OxDEAD
+# Team: OxDEAD
+# Model: EfficientNet-B2 (Noisy-Student) | IMG: 224x224
+# Usage:
+#   python OxDEADClass.py                          → Model haqida ma'lumot
+#   python OxDEADClass.py --test_dir path/to/imgs  → Inference & Excel yaratish
 # ============================================================
 
-import os, argparse
+import os, sys, argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -16,9 +20,28 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from tqdm import tqdm
 
+# ─── Auto-detect model file next to this script ─────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_FILE = os.path.join(SCRIPT_DIR, "OxDEADClassModel.pth")
+TEAM_NAME = "OxDEAD"
+
+def build_tta_images(img_resized):
+    return [
+        img_resized,
+        np.fliplr(img_resized).copy(),
+        np.flipud(img_resized).copy(),
+        np.rot90(img_resized, 1).copy(),
+    ]
+
+
+def image_id_sort_key(value):
+    value = str(value)
+    return (0, int(value)) if value.isdigit() else (1, value)
+
+
 # ─── Preprocessing ──────────────────────────────────────────────────────────
 def robust_resize(img, sz):
-    """Aspect-ratio preserving padding (Matches V5 Training)"""
+    """Aspect-ratio preserving padding (Matches Training Pipeline)"""
     h, w = img.shape[:2]
     scale = sz / max(h, w)
     new_h, new_w = int(h * scale), int(w * scale)
@@ -31,74 +54,85 @@ def robust_resize(img, sz):
     return img
 
 # ─── TTA ────────────────────────────────────────────────────────────────────
-def get_tta_transforms():
-    """Returns basic augmentations for TTA (Resize is handled by robust_resize)"""
-    return [
-        None, # Original
-        A.HorizontalFlip(p=1.0),
-        A.VerticalFlip(p=1.0),
-        A.RandomRotate90(p=1.0)
-    ]
-
 @torch.no_grad()
 def predict_tta(model, img_np, img_size, device):
-    all_probs = []
-    
-    # Base normalization/tensorization
     base_tfm = A.Compose([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
-
-    # 1. Resize once using robust logic
     img_resized = robust_resize(img_np, img_size)
     
-    # 2. Apply TTA
-    tta_ops = get_tta_transforms()
-    for op in tta_ops:
-        aug_img = op(image=img_resized)["image"] if op else img_resized
+    all_probs = []
+    for aug_img in build_tta_images(img_resized):
         tensor = base_tfm(image=aug_img)["image"].unsqueeze(0).to(device)
-        
         with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
             logits = model(tensor)
-        probs = F.softmax(logits, dim=1)
-        all_probs.append(probs)
+        all_probs.append(F.softmax(logits, dim=1))
 
     avg_probs = torch.stack(all_probs).mean(dim=0)
     return avg_probs.argmax(dim=1).item()
 
+# ─── Model Info ─────────────────────────────────────────────────────────────
+def show_model_info(ckpt):
+    print("=" * 55)
+    print("  🤖 OxDEAD Classification Model — Info")
+    print("=" * 55)
+    print(f"  Team:           {TEAM_NAME}")
+    print(f"  Architecture:   {ckpt.get('model_name', 'N/A')}")
+    print(f"  Image Size:     {ckpt.get('img_size', 'N/A')}x{ckpt.get('img_size', 'N/A')}")
+    print(f"  Num Classes:    {ckpt.get('num_classes', 12)}")
+    print(f"  Saved Epoch:    {ckpt.get('epoch', 'N/A')}")
+    val_acc = ckpt.get('val_acc')
+    print(f"  Val Accuracy:   {val_acc*100:.2f}%" if isinstance(val_acc, (int, float)) else "  Val Accuracy:   N/A")
+    print(f"  Preprocessing:  Robust Padding (aspect-ratio preserving)")
+    print(f"  TTA:            4x (Original + HFlip + VFlip + Rot90)")
+    print(f"  Model File:     {MODEL_FILE}")
+    print("=" * 55)
+    print(f"\n  💡 Usage: python {os.path.basename(__file__)} --test_dir <path/to/test/images>")
+    print(f"     Output: {TEAM_NAME} test_ground_truth.xlsx\n")
+
 # ─── Main ───────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Classification Inference Script")
-    parser.add_argument("--test_dir", type=str, required=True, help="Directory containing test images")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the trained PyTorch model (.pth)")
-    parser.add_argument("--team", type=str, default="Baxrom", help="Your team name for the output Excel file")
+    parser = argparse.ArgumentParser(description="OxDEAD Classification Inference")
+    parser.add_argument("--test_dir", type=str, default=None, help="Directory containing test images")
     args = parser.parse_args()
 
-    if not os.path.exists(args.model_path):
-        print(f"❌ Model topilmadi: {args.model_path}")
+    # Check model exists
+    if not os.path.exists(MODEL_FILE):
+        print(f"❌ Model topilmadi: {MODEL_FILE}")
+        print(f"   OxDEADClassModel.pth faylini shu skript bilan bir papkaga qo'ying.")
         return
+
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    ckpt = torch.load(MODEL_FILE, map_location=device, weights_only=False)
+
+    # If no test_dir → show model info and exit
+    if args.test_dir is None:
+        show_model_info(ckpt)
+        return
+
+    # Validate test directory
     if not os.path.exists(args.test_dir):
         print(f"❌ Test papkasi topilmadi: {args.test_dir}")
         return
 
-    output_file = f"{args.team} test_ground_truth.xlsx"
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        
-    print(f"🚀 Loading Classification Model on {device}: {args.model_path}")
-    ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
+    # Load model
     num_classes = ckpt.get("num_classes", 12)
-    val_acc = ckpt.get("val_acc")
+    model_name = ckpt.get("model_name", "tf_efficientnet_b2.ns_jft_in1k")
+    img_size = ckpt.get("img_size", 224)
 
-    model = timm.create_model(ckpt.get("model_name", "tf_efficientnet_b2.ns_jft_in1k"), pretrained=False, num_classes=num_classes)
+    print(f"🚀 Loading {model_name} on {device.upper()}...")
+    model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()
-    val_acc_text = f"{val_acc:.4f}" if isinstance(val_acc, (int, float)) else "N/A"
-    print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, Acc: {val_acc_text})")
+    
+    val_acc = ckpt.get('val_acc')
+    val_text = f"{val_acc*100:.2f}%" if isinstance(val_acc, (int, float)) else "N/A"
+    print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, Acc: {val_text})")
 
-    img_size = ckpt.get("img_size", 224)
+    # Run inference
     files = sorted([f for f in os.listdir(args.test_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
-    print(f"📸 Test images found: {len(files)} | Preprocessing: Robust Padding ({img_size}x{img_size})")
+    print(f"📸 Test images: {len(files)} | Preprocessing: Robust Padding ({img_size}x{img_size})")
 
     all_ids, all_preds = [], []
     for f in tqdm(files, desc="Predicting"):
@@ -110,16 +144,15 @@ def main():
                 raise ValueError(f"Predicted label {pred} is outside 0..{num_classes - 1}")
         except Exception as e:
             raise RuntimeError(f"Error processing {f}: {e}") from e
-
         all_ids.append(os.path.splitext(f)[0])
         all_preds.append(pred)
 
-    df = pd.DataFrame({"Image_ID": all_ids, "Label": all_preds})
-    # Convert to integer for proper numerical sorting
-    df["Image_ID"] = pd.to_numeric(df["Image_ID"], errors="coerce")
-    df = df.sort_values("Image_ID").reset_index(drop=True)
+    # Save Excel
+    output_file = f"{TEAM_NAME} test_ground_truth.xlsx"
+    rows = sorted(zip(all_ids, all_preds), key=lambda row: image_id_sort_key(row[0]))
+    df = pd.DataFrame(rows, columns=["Image_ID", "Label"])
     df.to_excel(output_file, index=False)
-    print(f"\n✅ Submission tayyor: {output_file} ({len(df)} ta bashorat)")
+    print(f"\n✅ Natija saqlandi: {output_file} ({len(df)} ta bashorat)")
 
 if __name__ == "__main__":
     main()

@@ -54,6 +54,7 @@ class CFG:
     ENCODER = "timm-efficientnet-b3"
     ENCODER_WEIGHTS = "noisy-student"
     DECODER = "UnetPlusPlus"
+    DECODER_ATTENTION_TYPE = "scse"
 
     EPOCHS = 30
     BATCH_SIZE = 16
@@ -132,20 +133,20 @@ class SegmentationDataset(Dataset):
         raw_images = sorted([f for f in os.listdir(img_dir) if f.lower().endswith((".png", ".jpg"))])
         
         print(f"  📥 Loading {len(raw_images)} segmentation pairs into RAM...")
-        self.images = np.empty((len(raw_images), 224, 224, 3), dtype=np.uint8)
-        self.masks = np.empty((len(raw_images), 224, 224), dtype=np.float32)
+        self.images = np.empty((len(raw_images), CFG.IMG_SIZE, CFG.IMG_SIZE, 3), dtype=np.uint8)
+        self.masks = np.empty((len(raw_images), CFG.IMG_SIZE, CFG.IMG_SIZE), dtype=np.float32)
         
         for i, fname in enumerate(tqdm(raw_images, leave=False)):
             # Image
             img = cv2.imread(os.path.join(self.img_dir, fname), cv2.IMREAD_COLOR)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = robust_resize(img, 224, is_mask=False) 
+            img = robust_resize(img, CFG.IMG_SIZE, is_mask=False)
             
             # Mask
             m_path = os.path.join(self.mask_dir, os.path.splitext(fname)[0] + ".png")
             if not os.path.exists(m_path): m_path = os.path.join(self.mask_dir, fname)
             mask = cv2.imread(m_path, cv2.IMREAD_GRAYSCALE)
-            mask = robust_resize(mask, 224, is_mask=True) 
+            mask = robust_resize(mask, CFG.IMG_SIZE, is_mask=True)
             mask = (mask > 127).astype(np.float32)
             
             self.images[i] = img
@@ -213,6 +214,27 @@ def compute_iou(preds, targets, th=0.5):
     uni = p.sum(dim=(2, 3)) + targets.sum(dim=(2, 3)) - inter
     return ((inter + 1e-6) / (uni + 1e-6)).mean().item()
 
+def predict_logits_tta(model, images, amp_device, amp_enabled):
+    with torch.amp.autocast(amp_device, enabled=amp_enabled):
+        out1 = model(images)
+        out2 = torch.flip(model(torch.flip(images, dims=[3])), dims=[3])
+        out3 = torch.flip(model(torch.flip(images, dims=[2])), dims=[2])
+        out4 = torch.rot90(model(torch.rot90(images, 1, dims=[2, 3])), -1, dims=[2, 3])
+    return (out1 + out2 + out3 + out4) / 4.0
+
+def build_eval_model_from_checkpoint(model_path, device):
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    model = smp.UnetPlusPlus(
+        encoder_name=ckpt.get("encoder", CFG.ENCODER),
+        encoder_weights=None,
+        in_channels=3,
+        classes=1,
+        decoder_attention_type=ckpt.get("decoder_attention_type", CFG.DECODER_ATTENTION_TYPE),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, ckpt
+
 # ─── Training Loop ───────────────────────────────────────────────────────────
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, device, preprocessor, cfg):
     model.train()
@@ -255,11 +277,8 @@ def validate(model, loader, criterion, device, preprocessor):
     amp_device = "cuda" if amp_enabled else "cpu"
     for images, masks in tqdm(loader, desc="  Valid", leave=False):
         images, masks = preprocessor(images, masks, is_train=False)
+        outputs = predict_logits_tta(model, images, amp_device, amp_enabled)
         with torch.amp.autocast(amp_device, enabled=amp_enabled):
-            out1 = model(images)
-            out2 = torch.flip(model(torch.flip(images, dims=[3])), dims=[3])
-            out3 = torch.flip(model(torch.flip(images, dims=[2])), dims=[2])
-            outputs = (out1 + out2 + out3) / 3.0
             loss = criterion(outputs, masks)
         bs = images.size(0)
         running_loss += loss.item() * bs
@@ -276,11 +295,7 @@ def find_best_threshold(model, loader, device, preprocessor):
     all_preds, all_masks = [], []
     for images, masks in tqdm(loader, desc="  Threshold search", leave=False):
         images, masks = preprocessor(images, masks, is_train=False)
-        with torch.amp.autocast(amp_device, enabled=amp_enabled):
-            out1 = model(images)
-            out2 = torch.flip(model(torch.flip(images, dims=[3])), dims=[3])
-            out3 = torch.flip(model(torch.flip(images, dims=[2])), dims=[2])
-            outputs = (out1 + out2 + out3) / 3.0
+        outputs = predict_logits_tta(model, images, amp_device, amp_enabled)
         all_preds.append(torch.sigmoid(outputs.float()).cpu())
         all_masks.append(masks.cpu())
     
@@ -298,7 +313,7 @@ def find_best_threshold(model, loader, device, preprocessor):
             best_iou = iou
             best_th = th
     print(f"  ✅ Best threshold: {best_th:.2f} (IoU: {best_iou:.4f})")
-    return best_th
+    return best_th, best_iou
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 def main():
@@ -334,7 +349,7 @@ def main():
         encoder_weights=CFG.ENCODER_WEIGHTS, 
         in_channels=3, 
         classes=1,
-        decoder_attention_type="scse",  # Spatial + Channel Squeeze-Excitation
+        decoder_attention_type=CFG.DECODER_ATTENTION_TYPE,
     ).to(CFG.DEVICE)
     
     print(f"  ⚡️ Using Single GPU: {CFG.DEVICE.upper()}")
@@ -374,6 +389,7 @@ def main():
                 "model_state_dict": state_dict,
                 "encoder": CFG.ENCODER,
                 "decoder": CFG.DECODER,
+                "decoder_attention_type": CFG.DECODER_ATTENTION_TYPE,
                 "img_size": CFG.IMG_SIZE,
                 "val_iou": best_iou,
                 "epoch": epoch
@@ -392,12 +408,14 @@ def main():
 
     # ── Threshold Optimization ──
     print(f"\n🔍 Searching for optimal threshold on Validation set...")
-    best_th = find_best_threshold(model, val_loader, CFG.DEVICE, preprocessor)
+    best_model_path = os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth")
+    best_model, best_ckpt = build_eval_model_from_checkpoint(best_model_path, CFG.DEVICE)
+    best_th, tuned_iou = find_best_threshold(best_model, val_loader, CFG.DEVICE, preprocessor)
     
-    # Re-save best model with optimal threshold
-    best_ckpt = torch.load(os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth"), map_location=CFG.DEVICE, weights_only=False)
+    # Re-save best model with optimal threshold computed on the best checkpoint.
     best_ckpt["best_threshold"] = best_th
-    torch.save(best_ckpt, os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth"))
+    best_ckpt["threshold_iou"] = tuned_iou
+    torch.save(best_ckpt, best_model_path)
     print(f"  ✅ Threshold {best_th:.2f} saved to checkpoint")
 
     print(f"\n{'='*60}\n  ✅ Training Done! Best IoU: {best_iou:.4f} | Optimal Threshold: {best_th:.2f} | Total ⏱️ {(time.time()-start_time)/60:.1f} min\n{'='*60}")

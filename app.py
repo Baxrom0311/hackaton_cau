@@ -42,6 +42,34 @@ def restore_original_mask(prob_mask, orig_h, orig_w, resize_meta):
     x1 = x0 + resize_meta["new_w"]
     cropped = prob_mask[y0:y1, x0:x1]
     return cv2.resize(cropped, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+
+def load_segmentation_model_from_checkpoint(seg_ckpt, device):
+    attention_candidates = [seg_ckpt.get("decoder_attention_type")]
+    if attention_candidates[0] is None:
+        attention_candidates.append("scse")
+
+    last_error = None
+    for attention_type in attention_candidates:
+        seg_model = smp.UnetPlusPlus(
+            encoder_name=seg_ckpt.get("encoder", "efficientnet-b2"),
+            encoder_weights=None,
+            in_channels=3,
+            classes=1,
+            activation=None,
+            decoder_attention_type=attention_type,
+        )
+        try:
+            seg_model.load_state_dict(seg_ckpt["model_state_dict"])
+            seg_model.to(device).eval()
+            seg_model.decoder_attention_type = attention_type
+            return seg_model
+        except RuntimeError as exc:
+            last_error = exc
+
+    raise last_error
+
+
 @st.cache_resource
 def load_models(cls_path, seg_path, device):
     """Loads classification and segmentation models safely"""
@@ -66,16 +94,8 @@ def load_models(cls_path, seg_path, device):
     if os.path.exists(seg_path):
         try:
             seg_ckpt = torch.load(seg_path, map_location=device, weights_only=False)
-            seg_model = smp.UnetPlusPlus(
-                encoder_name=seg_ckpt.get("encoder", "efficientnet-b2"),
-                encoder_weights=None,
-                in_channels=3, 
-                classes=1, 
-                activation=None,
-            )
-            seg_model.load_state_dict(seg_ckpt["model_state_dict"])
-            seg_model.to(device).eval()
-            
+            seg_model = load_segmentation_model_from_checkpoint(seg_ckpt, device)
+
             # Extract metadata and store in model object temporarily for inference
             seg_model.img_size = seg_ckpt.get("img_size", 224)
             seg_model.best_threshold = seg_ckpt.get("best_threshold", 0.5)
@@ -458,4 +478,3 @@ else:
         <p>{t['upload_req']}</p>
     </div>
     """, unsafe_allow_html=True)
-

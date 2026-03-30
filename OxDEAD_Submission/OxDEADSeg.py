@@ -1,12 +1,14 @@
 # ============================================================
 # AI Healthcare Hackathon 2026 — Inference: Segmentation
 # ============================================================
-# ✅ Loads best model dynamically from args
-# ✅ Applies Test-Time Augmentation (4x)
-# ✅ Generates `[TeamName]` folder with predicted masks
+# Team: OxDEAD
+# Model: UNet++ + EfficientNet-B2 | IMG: 224x224
+# Usage:
+#   python OxDEADSeg.py                          → Model haqida ma'lumot
+#   python OxDEADSeg.py --test_dir path/to/imgs  → Inference & masklar yaratish
 # ============================================================
 
-import os, argparse
+import os, sys, argparse
 import torch
 import numpy as np
 import cv2
@@ -16,9 +18,14 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from tqdm import tqdm
 
+# ─── Auto-detect model file next to this script ─────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_FILE = os.path.join(SCRIPT_DIR, "OxDEADSegModel.pth")
+TEAM_NAME = "OxDEAD"
+
 # ─── Preprocessing ──────────────────────────────────────────────────────────
 def robust_resize(img, sz, is_mask=False, return_meta=False):
-    """Aspect-ratio preserving padding (Matches V5 Training)"""
+    """Aspect-ratio preserving padding (Matches Training Pipeline)"""
     h, w = img.shape[:2]
     scale = sz / max(h, w)
     new_h, new_w = int(h * scale), int(w * scale)
@@ -51,11 +58,35 @@ def postprocess_mask(mask_binary):
         mask = (labels == largest).astype(np.uint8)
     return mask
 
+
+def load_segmentation_model(ckpt, device):
+    attention_candidates = [ckpt.get("decoder_attention_type")]
+    if attention_candidates[0] is None:
+        attention_candidates.append("scse")
+
+    last_error = None
+    for attention_type in attention_candidates:
+        model = smp.UnetPlusPlus(
+            encoder_name=ckpt.get("encoder", "efficientnet-b2"),
+            encoder_weights=None,
+            in_channels=3,
+            classes=1,
+            activation=None,
+            decoder_attention_type=attention_type,
+        )
+        try:
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.to(device).eval()
+            return model, attention_type
+        except RuntimeError as exc:
+            last_error = exc
+
+    raise last_error
+
+# ─── TTA Prediction ─────────────────────────────────────────────────────────
 @torch.no_grad()
 def predict_mask_tta(model, img_np, img_size, device, threshold=0.5):
     h_orig, w_orig = img_np.shape[:2]
-    
-    # 1. Resize once using robust logic
     img_resized, resize_meta = robust_resize(img_np, img_size, return_meta=True)
     
     base_tfm = A.Compose([
@@ -70,7 +101,6 @@ def predict_mask_tta(model, img_np, img_size, device, threshold=0.5):
         return torch.sigmoid(logits.float()).squeeze(0).squeeze(0).cpu().numpy()
 
     preds = []
-    # TTA: Original, Horz, Vert, Rot90
     preds.append(predict_single(img_resized))
     preds.append(np.fliplr(predict_single(np.fliplr(img_resized).copy())))
     preds.append(np.flipud(predict_single(np.flipud(img_resized).copy())))
@@ -82,43 +112,76 @@ def predict_mask_tta(model, img_np, img_size, device, threshold=0.5):
     binary_mask = postprocess_mask(binary_mask)
     return binary_mask * 255
 
+# ─── Model Info ─────────────────────────────────────────────────────────────
+def show_model_info(ckpt):
+    print("=" * 55)
+    print("  🔬 OxDEAD Segmentation Model — Info")
+    print("=" * 55)
+    print(f"  Team:           {TEAM_NAME}")
+    print(f"  Architecture:   UNet++ (smp)")
+    print(f"  Encoder:        {ckpt.get('encoder', 'N/A')}")
+    print(f"  Image Size:     {ckpt.get('img_size', 'N/A')}x{ckpt.get('img_size', 'N/A')}")
+    print(f"  Saved Epoch:    {ckpt.get('epoch', 'N/A')}")
+    val_iou = ckpt.get('val_iou')
+    print(f"  Val IoU:        {val_iou*100:.2f}%" if isinstance(val_iou, (int, float)) else "  Val IoU:        N/A")
+    best_th = ckpt.get('best_threshold', 0.5)
+    print(f"  Best Threshold: {best_th:.2f}")
+    print(f"  Preprocessing:  Robust Padding (aspect-ratio preserving)")
+    print(f"  TTA:            4x (Original + HFlip + VFlip + Rot90)")
+    print(f"  Postprocess:    Morphological Closing + Largest Component")
+    print(f"  Model File:     {MODEL_FILE}")
+    print("=" * 55)
+    print(f"\n  💡 Usage: python {os.path.basename(__file__)} --test_dir <path/to/test/images>")
+    print(f"     Output: {TEAM_NAME}/ folder with predicted PNG masks\n")
+
 # ─── Main ───────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Segmentation Inference Script")
-    parser.add_argument("--test_dir", type=str, required=True, help="Directory containing test images")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to the trained PyTorch model (.pth)")
-    parser.add_argument("--team", type=str, default="Baxrom", help="Your team name for the output folder")
+    parser = argparse.ArgumentParser(description="OxDEAD Segmentation Inference")
+    parser.add_argument("--test_dir", type=str, default=None, help="Directory containing test images")
     args = parser.parse_args()
 
-    if not os.path.exists(args.model_path):
-        print(f"❌ Model topilmadi: {args.model_path}")
+    # Check model exists
+    if not os.path.exists(MODEL_FILE):
+        print(f"❌ Model topilmadi: {MODEL_FILE}")
+        print(f"   OxDEADSegModel.pth faylini shu skript bilan bir papkaga qo'ying.")
         return
+
+    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    ckpt = torch.load(MODEL_FILE, map_location=device, weights_only=False)
+
+    # If no test_dir → show model info and exit
+    if args.test_dir is None:
+        show_model_info(ckpt)
+        return
+
+    # Validate test directory
     if not os.path.exists(args.test_dir):
         print(f"❌ Test papkasi topilmadi: {args.test_dir}")
         return
 
-    output_dir = args.team
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-        
-    print(f"🚀 Loading Segmentation Model on {device}: {args.model_path}")
-    ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
-    
-    model = smp.UnetPlusPlus(
-        encoder_name=ckpt.get("encoder", "efficientnet-b2"),
-        encoder_weights=None,
-        in_channels=3, classes=1, activation=None,
-    )
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
-    val_iou = ckpt.get("val_iou")
-    best_th = ckpt.get("best_threshold", 0.5)
-    val_iou_text = f"{val_iou:.4f}" if isinstance(val_iou, (int, float)) else "N/A"
-    print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, IoU: {val_iou_text}, Threshold: {best_th:.2f})")
-
-    os.makedirs(output_dir, exist_ok=True)
+    # Load model
+    encoder_name = ckpt.get("encoder", "efficientnet-b2")
     img_size = ckpt.get("img_size", 224)
+    if "best_threshold" not in ckpt:
+        print("⚠️ best_threshold checkpointda yo'q, default 0.50 ishlatiladi.")
+    best_th = ckpt.get("best_threshold", 0.5)
+
+    print(f"🚀 Loading UNet++ ({encoder_name}) on {device.upper()}...")
+    model, attention_type = load_segmentation_model(ckpt, device)
+
+    val_iou = ckpt.get('val_iou')
+    iou_text = f"{val_iou*100:.2f}%" if isinstance(val_iou, (int, float)) else "N/A"
+    attention_text = attention_type or "none"
+    print(
+        f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, IoU: {iou_text}, "
+        f"Threshold: {best_th:.2f}, Attention: {attention_text})"
+    )
+
+    # Run inference
+    output_dir = TEAM_NAME
+    os.makedirs(output_dir, exist_ok=True)
     files = sorted([f for f in os.listdir(args.test_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
-    print(f"📸 Test images found: {len(files)} | Preprocessing: Robust Padding ({img_size}x{img_size})")
+    print(f"📸 Test images: {len(files)} | Preprocessing: Robust Padding ({img_size}x{img_size})")
 
     saved_masks = 0
     for f in tqdm(files, desc="Predicting masks"):
@@ -126,14 +189,13 @@ def main():
         try:
             img = np.array(Image.open(path).convert("RGB"))
             mask = predict_mask_tta(model, img, img_size, device, threshold=best_th)
-    
             out_name = os.path.splitext(f)[0] + ".png"
             Image.fromarray(mask).save(os.path.join(output_dir, out_name))
             saved_masks += 1
         except Exception as e:
             raise RuntimeError(f"Error processing {f}: {e}") from e
 
-    print(f"\n✅ Submission tayyor: {output_dir}/ papkasida ({saved_masks} ta fayl)")
+    print(f"\n✅ Natija saqlandi: {output_dir}/ ({saved_masks} ta mask)")
 
 if __name__ == "__main__":
     main()

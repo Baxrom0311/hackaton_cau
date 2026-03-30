@@ -51,6 +51,32 @@ def postprocess_mask(mask_binary):
         mask = (labels == largest).astype(np.uint8)
     return mask
 
+
+def load_segmentation_model(ckpt, device):
+    encoder_name = ckpt.get("encoder", "efficientnet-b2")
+    attention_candidates = [ckpt.get("decoder_attention_type")]
+    if attention_candidates[0] is None:
+        attention_candidates.append("scse")
+
+    last_error = None
+    for attention_type in attention_candidates:
+        model = smp.UnetPlusPlus(
+            encoder_name=encoder_name,
+            encoder_weights=None,
+            in_channels=3,
+            classes=1,
+            activation=None,
+            decoder_attention_type=attention_type,
+        )
+        try:
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.to(device).eval()
+            return model, attention_type
+        except RuntimeError as exc:
+            last_error = exc
+
+    raise last_error
+
 @torch.no_grad()
 def predict_mask_tta(model, img_np, img_size, device, threshold=0.5):
     h_orig, w_orig = img_np.shape[:2]
@@ -103,17 +129,17 @@ def main():
     print(f"🚀 Loading Segmentation Model on {device}: {args.model_path}")
     ckpt = torch.load(args.model_path, map_location=device, weights_only=False)
     
-    model = smp.UnetPlusPlus(
-        encoder_name=ckpt.get("encoder", "efficientnet-b2"),
-        encoder_weights=None,
-        in_channels=3, classes=1, activation=None,
-    )
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device).eval()
+    model, attention_type = load_segmentation_model(ckpt, device)
     val_iou = ckpt.get("val_iou")
+    if "best_threshold" not in ckpt:
+        print("⚠️ best_threshold checkpointda yo'q, default 0.50 ishlatiladi.")
     best_th = ckpt.get("best_threshold", 0.5)
     val_iou_text = f"{val_iou:.4f}" if isinstance(val_iou, (int, float)) else "N/A"
-    print(f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, IoU: {val_iou_text}, Threshold: {best_th:.2f})")
+    attention_text = attention_type or "none"
+    print(
+        f"✅ Model loaded (Epoch: {ckpt.get('epoch', '?')}, IoU: {val_iou_text}, "
+        f"Threshold: {best_th:.2f}, Attention: {attention_text})"
+    )
 
     os.makedirs(output_dir, exist_ok=True)
     img_size = ckpt.get("img_size", 224)

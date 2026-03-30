@@ -13,6 +13,7 @@
 # ✅ Early Stopping (patience=7)
 # ============================================================
 
+import json
 import os, gc, time, random, math
 import torch
 import torch.nn as nn
@@ -31,24 +32,29 @@ import timm
 class CFG:
     BASE = "/kaggle/input/datasets/baxrom0311/main-dataset/Main hackathon dataset"
     TRAIN_DIR = f"{BASE}/classification/train"
-    MODEL_SAVE_DIR = "classification_v5"
+    MODEL_SAVE_DIR = "classification_v6"
+    SPLIT_MANIFEST_PATH = None
 
-    MODEL_NAME = "tf_efficientnet_b2.ns_jft_in1k" # Standardizing to B2
-    IMG_SIZE = 224
-    BATCH_SIZE = 64
-    EPOCHS = 40
-    MAX_LR = 1e-3
-    WEIGHT_DECAY = 1e-5
+    MODEL_NAME = "tf_efficientnet_b4.ns_jft_in1k"
+    IMG_SIZE = 380
+    BATCH_SIZE = 32
+    EPOCHS = 30
+    MAX_LR = 5e-4
+    WEIGHT_DECAY = 1e-4
     NUM_CLASSES = 12
     NUM_WORKERS = 0
     SEED = 42
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    GRAD_ACCUM_STEPS = 1
-    LABEL_SMOOTHING = 0.1
-    DROP_RATE = 0.3
-    EARLY_STOP_PATIENCE = 7
+    GRAD_ACCUM_STEPS = 2
+    LABEL_SMOOTHING = 0.15
+    DROP_RATE = 0.4
+    EARLY_STOP_PATIENCE = 8
     GRAD_CLIP = 5.0
-    MIXUP_ALPHA = 0.2
+    MIXUP_ALPHA = 0.4
+    CUTMIX_ALPHA = 1.0
+    CUTMIX_PROB = 0.5
+    VAL_FRACTION = 0.1
+    SPLIT_SEED = 42
 
 def robust_resize(img, sz):
     """Aspect-ratio preserving padding (Ultra Quality)"""
@@ -77,45 +83,83 @@ def seed_everything(seed):
     except Exception as e:
         print(f"⚠️ Seeding warning: {e}. If this is a CUDA error, RESTART YOUR KERNEL!")
 
+def collect_classification_items(root_dir):
+    items = []
+    for label in sorted((entry for entry in os.listdir(root_dir) if entry.isdigit()), key=int):
+        cls_dir = os.path.join(root_dir, label)
+        for img_name in sorted(os.listdir(cls_dir)):
+            if img_name.lower().endswith((".png", ".jpg", ".jpeg")):
+                items.append((os.path.join(cls_dir, img_name), int(label)))
+    return items
+
+def build_classification_split(root_dir, val_fraction, seed):
+    rng = random.Random(seed)
+    by_class = {}
+    for item in collect_classification_items(root_dir):
+        by_class.setdefault(item[1], []).append(item)
+
+    train_data, val_data = [], []
+    for cls_id in sorted(by_class):
+        cls_items = list(by_class[cls_id])
+        rng.shuffle(cls_items)
+        split = int((1.0 - val_fraction) * len(cls_items))
+        train_data.extend(cls_items[:split])
+        val_data.extend(cls_items[split:])
+
+    rng.shuffle(train_data)
+    rng.shuffle(val_data)
+    return train_data, val_data
+
+def save_split_manifest(path, root_dir, train_items, val_items, seed, val_fraction):
+    def serialize(items):
+        return [
+            {
+                "path": os.path.relpath(item_path, root_dir),
+                "label": label,
+            }
+            for item_path, label in items
+        ]
+
+    payload = {
+        "root_dir": root_dir,
+        "seed": seed,
+        "val_fraction": val_fraction,
+        "train_count": len(train_items),
+        "val_count": len(val_items),
+        "train": serialize(train_items),
+        "val": serialize(val_items),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+def load_split_manifest(path, root_dir):
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    def deserialize(rows):
+        return [
+            (os.path.join(root_dir, row["path"]), int(row["label"]))
+            for row in rows
+        ]
+
+    return deserialize(payload["train"]), deserialize(payload["val"])
+
 # ─── Dataset ────────────────────────────────────────────────────────────────
 class ClassificationDataset(Dataset):
-    def __init__(self, root_dir, transform=None, is_train=True):
+    def __init__(self, items, transform=None, split_name="train"):
         self.transform = transform
-        raw_data = []
-        for label in sorted(os.listdir(root_dir)):
-            if label.isdigit():
-                cls_dir = os.path.join(root_dir, label)
-                for img_name in os.listdir(cls_dir):
-                    if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        raw_data.append((os.path.join(cls_dir, img_name), int(label)))
-        
-        # Stratified Split — keeps class ratio balanced in train/val
-        random.seed(42)
-        by_class = {}
-        for item in raw_data:
-            by_class.setdefault(item[1], []).append(item)
-        train_data, val_data = [], []
-        for cls_items in by_class.values():
-            random.shuffle(cls_items)
-            split = int(0.9 * len(cls_items))
-            train_data.extend(cls_items[:split])
-            val_data.extend(cls_items[split:])
-        raw_data = train_data if is_train else val_data
-        random.shuffle(raw_data)
-
-        print(f"  📥 Loading {len(raw_data)} images into RAM (Train={is_train})...")
+        print(f"  📥 Loading {len(items)} images into RAM ({split_name})...")
         # Pre-allocate to prevent RAM doubling
-        self.images = np.empty((len(raw_data), 224, 224, 3), dtype=np.uint8)
-        self.labels = np.empty(len(raw_data), dtype=np.int64)
+        self.images = np.empty((len(items), CFG.IMG_SIZE, CFG.IMG_SIZE, 3), dtype=np.uint8)
+        self.labels = np.empty(len(items), dtype=np.int64)
         
-        for i, (path, label) in enumerate(tqdm(raw_data, leave=False)):
+        for i, (path, label) in enumerate(tqdm(items, leave=False)):
             img = cv2.imread(path)
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            img = robust_resize(img, 224) # 🛡️ Robust Padding
+            img = robust_resize(img, CFG.IMG_SIZE)
             self.images[i] = img
             self.labels[i] = label
         
-        del raw_data
         gc.collect()
 
     def __len__(self): return len(self.images)
@@ -198,6 +242,31 @@ def mixup_data(x, y, alpha=0.2):
 def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
+# ─── CutMix (SOTA Kaggle Trick) ─────────────────────────────────────────────
+def rand_bbox(size, lam):
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1.0 - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    return bbx1, bby1, bbx2, bby2
+
+def cutmix_data(x, y, alpha=1.0):
+    lam = np.random.beta(alpha, alpha)
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+    y_a, y_b = y, y[index]
+    return x, y_a, y_b, lam
+
 # ─── Training Loop ──────────────────────────────────────────────────────────
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, device, preprocessor, cfg):
     model.train()
@@ -210,20 +279,22 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, devi
         imgs = preprocessor(imgs, is_train=True)
         labels = labels.to(device, non_blocking=True)
         
-        # Mixup augmentation
-        if cfg.MIXUP_ALPHA > 0:
+        # CutMix or Mixup (randomly chosen)
+        use_cutmix = hasattr(cfg, 'CUTMIX_ALPHA') and np.random.rand() < cfg.CUTMIX_PROB
+        if use_cutmix:
+            imgs, labels_a, labels_b, lam = cutmix_data(imgs, labels, cfg.CUTMIX_ALPHA)
+        elif cfg.MIXUP_ALPHA > 0:
             imgs, labels_a, labels_b, lam = mixup_data(imgs, labels, cfg.MIXUP_ALPHA)
+        else:
+            labels_a, labels_b, lam = labels, labels, 1.0
         
         with torch.amp.autocast(amp_device, enabled=amp_enabled):
             outputs = model(imgs)
-            if cfg.MIXUP_ALPHA > 0:
-                loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam) / cfg.GRAD_ACCUM_STEPS
-            else:
-                loss = criterion(outputs, labels) / cfg.GRAD_ACCUM_STEPS
+            loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam) / cfg.GRAD_ACCUM_STEPS
         
         scaler.scale(loss).backward()
         
-        if (i+1) % cfg.GRAD_ACCUM_STEPS == 0:
+        if (i + 1) % cfg.GRAD_ACCUM_STEPS == 0 or (i + 1) == len(loader):
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.GRAD_CLIP)
             scaler.step(optimizer)
@@ -247,11 +318,13 @@ def validate(model, loader, criterion, device, preprocessor):
         imgs = preprocessor(imgs, is_train=False)
         labels = labels.to(device, non_blocking=True)
         
-        # TTA
+        # Match submission-time TTA so validation is leaderboard-adjacent.
         with torch.amp.autocast(amp_device, enabled=amp_enabled):
             out1 = model(imgs)
             out2 = model(torch.flip(imgs, dims=[3]))
-            outputs = (out1 + out2) / 2.0
+            out3 = model(torch.flip(imgs, dims=[2]))
+            out4 = model(torch.rot90(imgs, 1, dims=[2, 3]))
+            outputs = (out1 + out2 + out3 + out4) / 4.0
             loss = criterion(outputs, labels)
         running_loss += loss.item() * imgs.size(0)
         correct += (outputs.argmax(1) == labels).sum().item()
@@ -276,8 +349,18 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    train_ds = ClassificationDataset(CFG.TRAIN_DIR, get_train_transforms(CFG.IMG_SIZE), True)
-    val_ds = ClassificationDataset(CFG.TRAIN_DIR, get_val_transforms(CFG.IMG_SIZE), False)
+    if CFG.SPLIT_MANIFEST_PATH and os.path.exists(CFG.SPLIT_MANIFEST_PATH):
+        train_items, val_items = load_split_manifest(CFG.SPLIT_MANIFEST_PATH, CFG.TRAIN_DIR)
+        manifest_path = CFG.SPLIT_MANIFEST_PATH
+        print(f"  🧾 Using split manifest: {manifest_path}")
+    else:
+        train_items, val_items = build_classification_split(CFG.TRAIN_DIR, CFG.VAL_FRACTION, CFG.SPLIT_SEED)
+        manifest_path = os.path.join(CFG.MODEL_SAVE_DIR, "classification_split_manifest.json")
+        save_split_manifest(manifest_path, CFG.TRAIN_DIR, train_items, val_items, CFG.SPLIT_SEED, CFG.VAL_FRACTION)
+        print(f"  🧾 Split manifest: {manifest_path}")
+
+    train_ds = ClassificationDataset(train_items, get_train_transforms(CFG.IMG_SIZE), "train")
+    val_ds = ClassificationDataset(val_items, get_val_transforms(CFG.IMG_SIZE), "val")
     
     train_loader = DataLoader(train_ds, batch_size=CFG.BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=CFG.BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
@@ -333,7 +416,10 @@ def main():
                 "model_name": CFG.MODEL_NAME,
                 "num_classes": CFG.NUM_CLASSES,
                 "img_size": CFG.IMG_SIZE,
-                "val_acc": best_acc
+                "val_acc": best_acc,
+                "split_seed": CFG.SPLIT_SEED,
+                "val_fraction": CFG.VAL_FRACTION,
+                "split_manifest_path": manifest_path,
             }
             torch.save(checkpoint, os.path.join(CFG.MODEL_SAVE_DIR, "best_model.pth"))
             print(f"  ✅ Best saved! Accuracy: {best_acc:.4f}")

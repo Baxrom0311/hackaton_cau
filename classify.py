@@ -32,15 +32,18 @@ def robust_resize(img, sz):
                             cv2.BORDER_CONSTANT, value=0)
     return img
 
-# ─── TTA ────────────────────────────────────────────────────────────────────
-def get_tta_transforms():
-    """Returns basic augmentations for TTA (Resize is handled by robust_resize)"""
+def build_tta_images(img_resized):
     return [
-        None, # Original
-        A.HorizontalFlip(p=1.0),
-        A.VerticalFlip(p=1.0),
-        A.RandomRotate90(p=1.0)
+        img_resized,
+        np.fliplr(img_resized).copy(),
+        np.flipud(img_resized).copy(),
+        np.rot90(img_resized, 1).copy(),
     ]
+
+
+def image_id_sort_key(value):
+    value = str(value)
+    return (0, int(value)) if value.isdigit() else (1, value)
 
 @torch.no_grad()
 def predict_tta(model, img_np, img_size, device):
@@ -55,10 +58,8 @@ def predict_tta(model, img_np, img_size, device):
     # 1. Resize once using robust logic
     img_resized = robust_resize(img_np, img_size)
     
-    # 2. Apply TTA
-    tta_ops = get_tta_transforms()
-    for op in tta_ops:
-        aug_img = op(image=img_resized)["image"] if op else img_resized
+    # 2. Apply deterministic TTA
+    for aug_img in build_tta_images(img_resized):
         tensor = base_tfm(image=aug_img)["image"].unsqueeze(0).to(device)
         
         with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
@@ -116,10 +117,8 @@ def main():
         all_ids.append(os.path.splitext(f)[0])
         all_preds.append(pred)
 
-    df = pd.DataFrame({"Image_ID": all_ids, "Label": all_preds})
-    # Convert to integer for proper numerical sorting
-    df["Image_ID"] = pd.to_numeric(df["Image_ID"], errors="coerce")
-    df = df.sort_values("Image_ID").reset_index(drop=True)
+    rows = sorted(zip(all_ids, all_preds), key=lambda row: image_id_sort_key(row[0]))
+    df = pd.DataFrame(rows, columns=["Image_ID", "Label"])
     df.to_excel(output_file, index=False)
     print(f"\n✅ Submission tayyor: {output_file} ({len(df)} ta bashorat)")
 

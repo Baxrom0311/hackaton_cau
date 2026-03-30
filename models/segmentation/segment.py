@@ -5,21 +5,20 @@ Loads the trained segmentation model and generates binary masks.
 
 Usage:
     python segment.py <test_images_dir> <model_path> <output_dir>
-
-Example:
-    python segment.py Segmentation/testing/images models/segmentation/best_model.pth output_masks/
 """
 
+import argparse
 import os
-import sys
-import torch
-import numpy as np
-import cv2
+
 import albumentations as A
+import cv2
+import numpy as np
+import segmentation_models_pytorch as smp
+import torch
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from tqdm import tqdm
-import segmentation_models_pytorch as smp
+
 
 def robust_resize(img, sz, is_mask=False, return_meta=False):
     h, w = img.shape[:2]
@@ -29,10 +28,19 @@ def robust_resize(img, sz, is_mask=False, return_meta=False):
     img = cv2.resize(img, (new_w, new_h), interpolation=interp)
     pad_h = (sz - new_h) // 2
     pad_w = (sz - new_w) // 2
-    img = cv2.copyMakeBorder(img, pad_h, sz - new_h - pad_h, pad_w, sz - new_w - pad_w, cv2.BORDER_CONSTANT, value=0)
+    img = cv2.copyMakeBorder(
+        img,
+        pad_h,
+        sz - new_h - pad_h,
+        pad_w,
+        sz - new_w - pad_w,
+        cv2.BORDER_CONSTANT,
+        value=0,
+    )
     if return_meta:
         return img, {"pad_h": pad_h, "pad_w": pad_w, "new_h": new_h, "new_w": new_w}
     return img
+
 
 def restore_original_mask(prob_mask, orig_h, orig_w, resize_meta):
     y0 = resize_meta["pad_h"]
@@ -42,88 +50,114 @@ def restore_original_mask(prob_mask, orig_h, orig_w, resize_meta):
     cropped = prob_mask[y0:y1, x0:x1]
     return cv2.resize(cropped, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
 
-def get_transforms():
-    return A.Compose([
+
+def postprocess_mask(mask_binary):
+    mask = mask_binary.astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels > 1:
+        largest = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        mask = (labels == largest).astype(np.uint8)
+    return mask
+
+
+def load_segmentation_model(checkpoint, device):
+    attention_candidates = [checkpoint.get("decoder_attention_type")]
+    if attention_candidates[0] is None:
+        attention_candidates.append("scse")
+
+    last_error = None
+    for attention_type in attention_candidates:
+        model = smp.UnetPlusPlus(
+            encoder_name=checkpoint.get("encoder", "efficientnet-b2"),
+            encoder_weights=None,
+            in_channels=3,
+            classes=1,
+            activation=None,
+            decoder_attention_type=attention_type,
+        )
+        try:
+            model.load_state_dict(checkpoint["model_state_dict"])
+            model.to(device).eval()
+            return model, attention_type
+        except RuntimeError as exc:
+            last_error = exc
+
+    raise last_error
+
+
+@torch.no_grad()
+def predict_mask_tta(model, img_np, img_size, device, threshold=0.5):
+    orig_h, orig_w = img_np.shape[:2]
+    img_resized, resize_meta = robust_resize(img_np, img_size, return_meta=True)
+    base_tfm = A.Compose([
         A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
     ])
 
+    def predict_single(image):
+        tensor = base_tfm(image=image)["image"].unsqueeze(0).to(device)
+        with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", enabled=False):
+            logits = model(tensor)
+        return torch.sigmoid(logits.float()).squeeze(0).squeeze(0).cpu().numpy()
 
-@torch.no_grad()
+    preds = [
+        predict_single(img_resized),
+        np.fliplr(predict_single(np.fliplr(img_resized).copy())),
+        np.flipud(predict_single(np.flipud(img_resized).copy())),
+        np.rot90(predict_single(np.rot90(img_resized, 1).copy()), -1),
+    ]
+    avg_pred = np.mean(preds, axis=0).astype(np.float32)
+    avg_pred = restore_original_mask(avg_pred, orig_h, orig_w, resize_meta)
+    binary_mask = (avg_pred > threshold).astype(np.uint8)
+    binary_mask = postprocess_mask(binary_mask)
+    return binary_mask * 255
+
+
 def main():
-    if len(sys.argv) < 4:
-        print("Usage: python segment.py <test_images_dir> <model_path> <output_dir>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Bundled segmentation inference script")
+    parser.add_argument("test_dir", help="Directory containing test images")
+    parser.add_argument("model_path", help="Path to the trained segmentation checkpoint")
+    parser.add_argument("output_dir", help="Directory where masks will be saved")
+    args = parser.parse_args()
 
-    test_dir = sys.argv[1]
-    model_path = sys.argv[2]
-    output_dir = sys.argv[3]
+    if not os.path.isdir(args.test_dir):
+        raise FileNotFoundError(f"Test dir not found: {args.test_dir}")
+    if not os.path.exists(args.model_path):
+        raise FileNotFoundError(f"Model not found: {args.model_path}")
+
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    os.makedirs(output_dir, exist_ok=True)
+    checkpoint = torch.load(args.model_path, map_location=device, weights_only=False)
+    img_size = int(checkpoint.get("img_size", 224))
+    if "best_threshold" not in checkpoint:
+        print("⚠️ best_threshold checkpointda yo'q, default 0.50 ishlatiladi.")
+    best_threshold = float(checkpoint.get("best_threshold", 0.5))
+
+    model, attention_type = load_segmentation_model(checkpoint, device)
+
+    test_images = sorted(
+        f for f in os.listdir(args.test_dir)
+        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+    )
 
     print(f"Device: {device}")
-    print(f"Test dir: {test_dir}")
-    print(f"Model: {model_path}")
-    print(f"Output dir: {output_dir}")
-
-    # Load checkpoint
-    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    encoder = checkpoint["encoder"]
-    img_size = checkpoint["img_size"]
-
-    # Build model
-    model = smp.UnetPlusPlus(
-        encoder_name=encoder,
-        encoder_weights=None,
-        in_channels=3,
-        classes=1,
-        activation=None,
-    )
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
-    model.eval()
-
-    transform = get_transforms()
-
-    # Get test images
-    test_images = sorted([
-        f for f in os.listdir(test_dir)
-        if f.lower().endswith((".png", ".jpg", ".jpeg"))
-    ])
-
     print(f"Total test images: {len(test_images)}")
+    print(f"Preprocessing: robust letterbox ({img_size}x{img_size}) + 4x TTA")
+    print(f"Decoder attention: {attention_type or 'none'}")
 
     saved_masks = 0
-    for fname in tqdm(test_images, desc="Generating masks"):
-        # Read original image (keep original size)
-        img_path = os.path.join(test_dir, fname)
-        original_img = Image.open(img_path).convert("RGB")
-        original_w, original_h = original_img.size
-
-        img_np = np.array(original_img)
-
-        # Transform for model input
-        img_resized, resize_meta = robust_resize(img_np, img_size, return_meta=True)
-        transformed = transform(image=img_resized)
-        input_tensor = transformed["image"].unsqueeze(0).to(device)
-
-        # Predict
-        output = model(input_tensor)
-        pred = torch.sigmoid(output).squeeze().cpu().numpy().astype(np.float32)
-        pred = restore_original_mask(pred, original_h, original_w, resize_meta)
-
-        # Threshold to binary
-        binary_mask = (pred > 0.5).astype(np.uint8) * 255
-
-        mask_pil = Image.fromarray(binary_mask, mode="L")
-
-        # Save with same filename (PNG)
-        out_name = os.path.splitext(fname)[0] + ".png"
-        mask_pil.save(os.path.join(output_dir, out_name))
+    for image_name in tqdm(test_images, desc="Generating masks"):
+        img_path = os.path.join(args.test_dir, image_name)
+        image = np.array(Image.open(img_path).convert("RGB"))
+        mask = predict_mask_tta(model, image, img_size, device, threshold=best_threshold)
+        out_name = os.path.splitext(image_name)[0] + ".png"
+        Image.fromarray(mask, mode="L").save(os.path.join(args.output_dir, out_name))
         saved_masks += 1
 
-    print(f"\n✅ All {saved_masks} masks saved to: {output_dir}")
+    print(f"\n✅ All {saved_masks} masks saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
