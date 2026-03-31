@@ -1,0 +1,15 @@
+[Unit]
+Description=Nafisa Hackathon Streamlit UI
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/hackaton-ui
+Environment="PATH=/home/ubuntu/hackaton-ui/.venv/bin"
+ExecStart=/home/ubuntu/hackaton-ui/.venv/bin/streamlit run /home/ubuntu/hackaton-ui/app.py --server.address 127.0.0.1 --server.port 8501 --server.headless true
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
